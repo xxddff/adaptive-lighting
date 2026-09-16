@@ -28,8 +28,12 @@
   "options": {
     "step": {
       "init": {
-        "data": {},
-        "data_description": {},
+        "data": {
+          "color_source": "色温度の取得元"
+        },
+        "data_description": {
+          "color_source": "sun または Apple。Apple では明るさを手動変更しても色温度の自動調整を続けます。"
+        },
         "title": "明るさの自動調整オプション",
         "sections": {
           "advanced": {
@@ -42,7 +46,24 @@
             }
           }
         }
+      },
+      "apple": {
+        "title": "Apple カーブの取得元",
+        "description": "Home Assistant からアクセスできるプローブのベース URL と仮想ライト ID を指定します。プローブがオフラインでも保存できます。",
+        "data": {
+          "apple_probe_url": "プローブのベース URL",
+          "apple_curve_id": "カーブ ID"
+        }
       }
+    },
+    "error": {
+      "invalid_probe_url": "認証情報、クエリ、フラグメントを含まない HTTP(S) のベース URL を入力してください。",
+      "invalid_curve_id": "対応する 3 種類のカーブ ID から選択してください。"
+    }
+  },
+  "config": {
+    "abort": {
+      "invalid_apple_config": "Apple カーブの設定が無効です。"
     }
   }
 }

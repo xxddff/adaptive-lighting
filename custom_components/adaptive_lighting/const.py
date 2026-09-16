@@ -3,6 +3,7 @@
 from datetime import timedelta
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
@@ -34,6 +35,62 @@ DOCS[CONF_NAME] = "Display name for this switch. 📝"
 CONF_LIGHTS, DEFAULT_LIGHTS = "lights", []
 DOCS[CONF_LIGHTS] = "List of light entity_ids to be controlled (may be empty). 🌟"
 
+CONF_COLOR_SOURCE, DEFAULT_COLOR_SOURCE = "color_source", "sun"
+CONF_APPLE_PROBE_URL, DEFAULT_APPLE_PROBE_URL = "apple_probe_url", ""
+CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID = "apple_curve_id", "yeelight"
+APPLE_CURVE_IDS = ("yeelight", "ikea-zigbee", "ikea-matter")
+APPLE_OPTIONS = frozenset((CONF_APPLE_PROBE_URL, CONF_APPLE_CURVE_ID))
+DOCS[CONF_COLOR_SOURCE] = (
+    "Use the sun algorithm or a captured Apple color-temperature plan."
+)
+DOCS[CONF_APPLE_PROBE_URL] = (
+    "Apple Curve Probe base URL, for example http://192.168.1.50:8787."
+)
+DOCS[CONF_APPLE_CURVE_ID] = (
+    "Virtual light ID whose Apple plan should control these lights."
+)
+
+
+def normalize_apple_probe_url(value: str) -> str:
+    """Validate and normalize a probe base URL without making a request."""
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+        host = parsed.hostname
+        if (
+            parsed.scheme not in ("http", "https")
+            or not host
+            or any(character.isspace() for character in value)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or (port is not None and port < 1)
+        ):
+            raise ValueError  # noqa: TRY301
+    except (AttributeError, ValueError) as error:
+        message = (
+            "Enter an HTTP(S) probe base URL without credentials, query or fragment"
+        )
+        raise vol.Invalid(message) from error
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None and (parsed.scheme, port) not in (("http", 80), ("https", 443)):
+        authority = f"{authority}:{port}"
+    return urlunsplit((parsed.scheme, authority, parsed.path.rstrip("/"), "", ""))
+
+
+def validate_apple_settings(data: dict[str, Any]) -> dict[str, Any]:
+    """Require complete Apple configuration only when that source is selected."""
+    if data.get(CONF_COLOR_SOURCE, DEFAULT_COLOR_SOURCE) == "apple":
+        data[CONF_APPLE_PROBE_URL] = normalize_apple_probe_url(
+            data.get(CONF_APPLE_PROBE_URL, ""),
+        )
+        if data.get(CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID) not in APPLE_CURVE_IDS:
+            message = "Choose a supported Apple curve ID"
+            raise vol.Invalid(message)
+    return data
+
+
 CONF_DETECT_NON_HA_CHANGES, DEFAULT_DETECT_NON_HA_CHANGES = (
     "detect_non_ha_changes",
     False,
@@ -58,8 +115,7 @@ DOCS[CONF_INCLUDE_CONFIG_IN_ATTRIBUTES] = (
 
 CONF_INITIAL_TRANSITION, DEFAULT_INITIAL_TRANSITION = "initial_transition", 1
 DOCS[CONF_INITIAL_TRANSITION] = (
-    "Duration of the first transition when lights turn "
-    "from `off` to `on` in seconds. ⏲️"
+    "Duration of the first transition when lights turn from `off` to `on` in seconds. ⏲️"
 )
 
 CONF_SLEEP_TRANSITION, DEFAULT_SLEEP_TRANSITION = "sleep_transition", 1
@@ -162,8 +218,7 @@ DOCS[CONF_MIN_SUNRISE_TIME] = (
 
 CONF_MAX_SUNRISE_TIME = "max_sunrise_time"
 DOCS[CONF_MAX_SUNRISE_TIME] = (
-    "Set the latest virtual sunrise time (HH:MM:SS), allowing"
-    " for earlier sunrises. 🌅"
+    "Set the latest virtual sunrise time (HH:MM:SS), allowing for earlier sunrises. 🌅"
 )
 
 CONF_SUNSET_OFFSET, DEFAULT_SUNSET_OFFSET = "sunset_offset", 0
@@ -343,6 +398,7 @@ DOCS_APPLY = {
 
 # Basic options shown at top level in options flow (not in collapsed section)
 BASIC_OPTIONS: set[str] = {
+    CONF_COLOR_SOURCE,
     CONF_LIGHTS,
     CONF_MIN_BRIGHTNESS,
     CONF_MAX_BRIGHTNESS,
@@ -361,6 +417,9 @@ def int_between(min_int: int, max_int: int) -> vol.All:
 
 
 VALIDATION_TUPLES: list[tuple[str, Any, Any]] = [
+    (CONF_COLOR_SOURCE, DEFAULT_COLOR_SOURCE, vol.In(("sun", "apple"))),
+    (CONF_APPLE_PROBE_URL, DEFAULT_APPLE_PROBE_URL, str),
+    (CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID, vol.In(APPLE_CURVE_IDS)),
     (CONF_LIGHTS, DEFAULT_LIGHTS, cv.entity_ids),  # type: ignore[arg-type]
     (CONF_INTERVAL, DEFAULT_INTERVAL, cv.positive_int),
     (CONF_TRANSITION, DEFAULT_TRANSITION, VALID_TRANSITION),
@@ -502,11 +561,17 @@ _yaml_validation_tuples = [
     for key, default, validation in VALIDATION_TUPLES
 ] + [(CONF_NAME, DEFAULT_NAME, cv.string)]
 
-_DOMAIN_SCHEMA = vol.Schema(
-    {
-        vol.Optional(key, default=replace_none_str(default, vol.UNDEFINED)): validation
-        for key, default, validation in _yaml_validation_tuples
-    },
+_DOMAIN_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Optional(
+                key,
+                default=replace_none_str(default, vol.UNDEFINED),
+            ): validation
+            for key, default, validation in _yaml_validation_tuples
+        },
+    ),
+    validate_apple_settings,
 )
 
 
@@ -531,7 +596,7 @@ def change_switch_settings_schema() -> dict[vol.Marker, Any]:
         vol.Optional(CONF_USE_DEFAULTS, default="current"): cv.string,
     }
     # Modifying these after init isn't possible
-    skip = (CONF_INTERVAL, CONF_NAME, CONF_LIGHTS)
+    skip = (CONF_INTERVAL, CONF_NAME, CONF_LIGHTS, CONF_COLOR_SOURCE, *APPLE_OPTIONS)
     for k, _, valid in VALIDATION_TUPLES:
         if k not in skip:
             args[vol.Optional(k)] = valid

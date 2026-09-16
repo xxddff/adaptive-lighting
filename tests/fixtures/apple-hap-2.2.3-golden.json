@@ -1,0 +1,180 @@
+{
+  "oracle": "@homebridge/hap-nodejs 2.2.3 getCurrentAdaptiveLightingTransitionPoint + scheduleNextUpdate arithmetic",
+  "cases": [
+    {
+      "offset": 0,
+      "brightness": 0,
+      "mired": 395
+    },
+    {
+      "offset": 0,
+      "brightness": 10,
+      "mired": 395
+    },
+    {
+      "offset": 0,
+      "brightness": 50,
+      "mired": 375
+    },
+    {
+      "offset": 0,
+      "brightness": 100,
+      "mired": 350
+    },
+    {
+      "offset": 0,
+      "brightness": 150,
+      "mired": 350
+    },
+    {
+      "offset": 599999,
+      "brightness": 0,
+      "mired": 395
+    },
+    {
+      "offset": 599999,
+      "brightness": 10,
+      "mired": 395
+    },
+    {
+      "offset": 599999,
+      "brightness": 50,
+      "mired": 375
+    },
+    {
+      "offset": 599999,
+      "brightness": 100,
+      "mired": 350
+    },
+    {
+      "offset": 599999,
+      "brightness": 150,
+      "mired": 350
+    },
+    {
+      "offset": 600000,
+      "brightness": 0,
+      "mired": 395
+    },
+    {
+      "offset": 600000,
+      "brightness": 10,
+      "mired": 395
+    },
+    {
+      "offset": 600000,
+      "brightness": 50,
+      "mired": 375
+    },
+    {
+      "offset": 600000,
+      "brightness": 100,
+      "mired": 350
+    },
+    {
+      "offset": 600000,
+      "brightness": 150,
+      "mired": 350
+    },
+    {
+      "offset": 600001,
+      "brightness": 0,
+      "mired": 395
+    },
+    {
+      "offset": 600001,
+      "brightness": 10,
+      "mired": 395
+    },
+    {
+      "offset": 600001,
+      "brightness": 50,
+      "mired": 375
+    },
+    {
+      "offset": 600001,
+      "brightness": 100,
+      "mired": 350
+    },
+    {
+      "offset": 600001,
+      "brightness": 150,
+      "mired": 350
+    },
+    {
+      "offset": 2400000,
+      "brightness": 0,
+      "mired": 377
+    },
+    {
+      "offset": 2400000,
+      "brightness": 10,
+      "mired": 377
+    },
+    {
+      "offset": 2400000,
+      "brightness": 50,
+      "mired": 362
+    },
+    {
+      "offset": 2400000,
+      "brightness": 100,
+      "mired": 343
+    },
+    {
+      "offset": 2400000,
+      "brightness": 150,
+      "mired": 343
+    },
+    {
+      "offset": 4200000,
+      "brightness": 0,
+      "mired": 358
+    },
+    {
+      "offset": 4200000,
+      "brightness": 10,
+      "mired": 358
+    },
+    {
+      "offset": 4200000,
+      "brightness": 50,
+      "mired": 348
+    },
+    {
+      "offset": 4200000,
+      "brightness": 100,
+      "mired": 336
+    },
+    {
+      "offset": 4200000,
+      "brightness": 150,
+      "mired": 336
+    },
+    {
+      "offset": 7800000,
+      "brightness": 0,
+      "mired": 387
+    },
+    {
+      "offset": 7800000,
+      "brightness": 10,
+      "mired": 387
+    },
+    {
+      "offset": 7800000,
+      "brightness": 50,
+      "mired": 372
+    },
+    {
+      "offset": 7800000,
+      "brightness": 100,
+      "mired": 353
+    },
+    {
+      "offset": 7800000,
+      "brightness": 150,
+      "mired": 353
+    }
+  ]
+}

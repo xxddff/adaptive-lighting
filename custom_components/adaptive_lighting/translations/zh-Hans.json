@@ -11,7 +11,8 @@
       }
     },
     "abort": {
-      "already_configured": "此设备已配置"
+      "already_configured": "此设备已配置",
+      "invalid_apple_config": "Apple 曲线配置无效。"
     }
   },
   "options": {
@@ -20,6 +21,7 @@
         "title": "自适应照明选项",
         "description": "配置自适应照明组件。选项名称与YAML设置对齐。如果在YAML中定义了此条目，则此处不会显示任何选项。有关演示参数影响的交互式图表，请访问[此Web应用程序]({webapp_url})。有关更多详细信息，请参阅[官方文档]({docs_url})。",
         "data": {
+          "color_source": "色温来源",
           "lights": "lights：要控制的灯光实体ID列表（可以为空）。🌟",
           "interval": "频率(interval)",
           "transition": "过渡(transition)",
@@ -31,6 +33,7 @@
           "sleep_color_temp": "睡眠模式中的色温(sleep_color_temp)"
         },
         "data_description": {
+          "color_source": "选择 sun 或 Apple。Apple 使用指定的采集计划；手动调亮度后，色温继续自动变化。",
           "interval": "调整灯光的频率，以秒为单位。🔄",
           "transition": "灯光变化时的过渡持续时间，以秒为单位。🕑",
           "sleep_brightness": "睡眠模式中的亮度百分比。😴",
@@ -91,11 +94,21 @@
             }
           }
         }
+      },
+      "apple": {
+        "title": "Apple 曲线来源",
+        "description": "填写 Home Assistant 可以访问的采集器基础地址，并选择虚拟灯 ID。采集器离线时也可以保存。",
+        "data": {
+          "apple_probe_url": "采集器基础地址",
+          "apple_curve_id": "曲线 ID"
+        }
       }
     },
     "error": {
       "option_error": "无效的选项",
-      "entity_missing": "一个或多个选择的灯光实体在Home Assistant中不存在"
+      "entity_missing": "一个或多个选择的灯光实体在Home Assistant中不存在",
+      "invalid_probe_url": "请填写 HTTP(S) 基础地址，不包含账号密码、查询参数或片段。",
+      "invalid_curve_id": "请选择三种支持的曲线 ID 之一。"
     }
   },
   "services": {

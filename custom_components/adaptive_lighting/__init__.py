@@ -23,11 +23,13 @@ from .const import (
     UNDO_UPDATE_LISTENER,
     apply_service_schema,
     change_switch_settings_schema,
+    validate_apple_settings,
 )
 from .switch import (
     handle_apply_service,
     handle_change_switch_settings,
     handle_set_manual_control_service,
+    validate,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -102,6 +104,14 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Set up the component."""
+    try:
+        validate_apple_settings(validate(config_entry))
+    except vol.Invalid:
+        _LOGGER.exception(
+            "Invalid Apple curve configuration for %s",
+            config_entry.title,
+        )
+        return False
     data = hass.data.setdefault(DOMAIN, {})
 
     # This will reload any changes the user made to any YAML configurations.

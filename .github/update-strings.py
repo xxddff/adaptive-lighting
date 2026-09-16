@@ -30,7 +30,7 @@ def _partition_options(values):
     advanced = {
         key: values[key]
         for key, _, _ in const.VALIDATION_TUPLES
-        if key not in const.BASIC_OPTIONS and key in values
+        if key not in const.BASIC_OPTIONS | const.APPLE_OPTIONS and key in values
     }
     return basic, advanced
 
@@ -97,6 +97,7 @@ with en_fname.open() as f:
 
 en["config"]["step"]["user"] = strings["config"]["step"]["user"]
 en["options"]["step"]["init"] = deepcopy(options_step)
+en["options"]["step"]["apple"] = deepcopy(strings["options"]["step"]["apple"])
 en["services"] = services_json
 
 with en_fname.open("w") as f:

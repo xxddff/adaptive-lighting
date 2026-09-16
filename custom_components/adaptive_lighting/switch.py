@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import hashlib
 import logging
+import math
 import zoneinfo
 from copy import deepcopy
 from datetime import timedelta
@@ -15,6 +16,8 @@ import homeassistant.util.dt as dt_util
 import ulid_transform
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_BRIGHTNESS_STEP,
+    ATTR_BRIGHTNESS_STEP_PCT,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_RGB_COLOR,
     ATTR_SUPPORTED_COLOR_MODES,
@@ -86,6 +89,7 @@ from .adaptation_utils import (
     manual_control_event_attribute_to_flags,
     prepare_adaptation_data,
 )
+from .apple_source import async_get_source
 from .color_and_brightness import SunLightSettings
 from .const import (
     ADAPT_BRIGHTNESS_SWITCH,
@@ -96,10 +100,13 @@ from .const import (
     CONF_ADAPT_DELAY,
     CONF_ADAPT_ONLY_ON_BARE_TURN_ON,
     CONF_ADAPT_UNTIL_SLEEP,
+    CONF_APPLE_CURVE_ID,
+    CONF_APPLE_PROBE_URL,
     CONF_AUTORESET_CONTROL,
     CONF_BRIGHTNESS_MODE,
     CONF_BRIGHTNESS_MODE_TIME_DARK,
     CONF_BRIGHTNESS_MODE_TIME_LIGHT,
+    CONF_COLOR_SOURCE,
     CONF_DETECT_NON_HA_CHANGES,
     CONF_EXPAND_LIGHT_GROUPS,
     CONF_INCLUDE_CONFIG_IN_ATTRIBUTES,
@@ -167,6 +174,8 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
     from homeassistant.helpers.typing import NoEventData
+
+    from .apple_source import AppleSource
 
 try:
     from homeassistant.helpers.sun import get_astral_observer
@@ -635,6 +644,25 @@ def _turn_off_transition(turn_off_event: Event) -> float | None:
     return VALID_TRANSITION(transition)
 
 
+def _apple_off_to_on_params(hass: HomeAssistant, params: ServiceData) -> ServiceData:
+    """Normalize an explicit initial brightness, including relative turn-ons.
+
+    HA interprets brightness steps from an OFF light relative to zero, even
+    when a last-used brightness is retained in its attributes.
+    """
+    params = dict(params)
+    if ATTR_BRIGHTNESS_STEP in params:
+        params[ATTR_BRIGHTNESS] = clamp(params.pop(ATTR_BRIGHTNESS_STEP), 0, 255)
+    elif ATTR_BRIGHTNESS_STEP_PCT in params:
+        params[ATTR_BRIGHTNESS] = clamp(
+            round(255 * params.pop(ATTR_BRIGHTNESS_STEP_PCT) / 100),
+            0,
+            255,
+        )
+    preprocess_turn_on_alternatives(hass, params)
+    return params
+
+
 def _expand_light_groups(
     hass: HomeAssistant,
     lights: list[str],
@@ -900,6 +928,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self.hass = hass
         self.manager = manager
         self._removed = False
+        self._apple_owner_id = config_entry.entry_id
+        self._apple_generation = 0
+        self._apple_source: AppleSource | None = None
+        self._apple_brightness_timers: dict[str, CALLBACK_TYPE] = {}
         self.sleep_mode_switch = sleep_mode_switch
         self.adapt_color_switch = adapt_color_switch
         self.adapt_brightness_switch = adapt_brightness_switch
@@ -950,6 +982,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             service_data=data,
             defaults=defaults,
         )
+        # The provider belongs to the loaded config entry. Runtime resets of
+        # tunable settings must not detach it or silently change its identity.
+        for key in (CONF_COLOR_SOURCE, CONF_APPLE_PROBE_URL, CONF_APPLE_CURVE_ID):
+            data[key] = self._config_backup[key]
 
         # backup data for use in change_switch_settings "current" CONF_USE_DEFAULTS
         self._current_settings = data
@@ -990,6 +1026,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         self._take_over_control_mode = TakeOverControlMode(
             data[CONF_TAKE_OVER_CONTROL_MODE],
         )
+        self._color_source = data[CONF_COLOR_SOURCE]
+        if self._color_source == "apple":
+            self._take_over_control_mode = TakeOverControlMode.PAUSE_CHANGED
         self._detect_non_ha_changes = data[CONF_DETECT_NON_HA_CHANGES]
         self._adapt_only_on_bare_turn_on = data[CONF_ADAPT_ONLY_ON_BARE_TURN_ON]
         self._manual_control_on_external_turn_on = data[
@@ -1094,6 +1133,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         """Remove the listeners upon removing the component."""
         self._removed = True
         self._remove_listeners()
+        await self._async_stop_apple_source()
 
     def _resolve_lights(self, lights: list[str] | None = None) -> list[str]:
         """Apply this profile's group policy, preserving explicit member targets."""
@@ -1197,6 +1237,8 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         # is not called in `add_to_platform_abort`.
         # See https://github.com/basnijholt/adaptive-lighting/issues/658
         self._remove_listeners()
+        if self._apple_source is not None:
+            self.hass.async_create_task(self._async_stop_apple_source())
         try:
             # HACK: this is a private method in `Entity` which can change
             super()._call_on_remove_callbacks()
@@ -1212,6 +1254,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
     def _remove_listeners(self) -> None:
         self._remove_interval_listener()
+        for remove in self._apple_brightness_timers.values():
+            remove()
+        self._apple_brightness_timers.clear()
 
         while self.remove_listeners:
             remove_listener = self.remove_listeners.pop()
@@ -1246,6 +1291,18 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             & LightControlAttributes.COLOR
         ]
         extra_state_attributes.update(self._settings)
+        if self._uses_apple_color:
+            # An Apple color is a per-light function of brightness. No single
+            # color value can truthfully describe the whole profile.
+            for key in (
+                "color_temp_kelvin",
+                "color_temp_mired",
+                "rgb_color",
+                "xy_color",
+                "hs_color",
+            ):
+                if key in extra_state_attributes:
+                    extra_state_attributes[key] = None
         timers = self.manager.auto_reset_manual_control_timers
         extra_state_attributes["autoreset_time_remaining"] = {
             light: time
@@ -1276,9 +1333,24 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         )
         if self.is_on:
             return
+        self._apple_generation += 1
+        generation = self._apple_generation
         self._state = True
         self.manager.reset(*self.lights)
         await self._setup_listeners()
+        if self._color_source == "apple":
+            self._apple_source = await async_get_source(
+                self.hass,
+                self._current_settings[CONF_APPLE_PROBE_URL],
+                self._current_settings[CONF_APPLE_CURVE_ID],
+            )
+            await self._apple_source.async_add_listener(
+                self._apple_owner_id,
+                self._name,
+                self._async_apple_source_changed,
+            )
+            if not self.is_on or self._removed or generation != self._apple_generation:
+                return
         if adapt_lights:
             await self._update_attrs_and_maybe_adapt_lights(
                 context=self.create_context("turn_on"),
@@ -1290,9 +1362,89 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         """Turn off adaptive lighting."""
         if not self.is_on:
             return
+        self._apple_generation += 1
         self._state = False
         self._remove_listeners()
+        await self._async_stop_apple_source()
         self.manager.reset(*self.lights)
+
+    @property
+    def _uses_apple_color(self) -> bool:
+        return bool(
+            self._apple_source is not None
+            and self._apple_source.uses_apple
+            and not self.sleep_mode_switch.is_on,
+        )
+
+    async def _async_stop_apple_source(self) -> None:
+        source, self._apple_source = self._apple_source, None
+        if source is not None:
+            await source.async_remove_listener(self._apple_owner_id)
+
+    async def _async_apple_source_changed(self) -> None:
+        if self.is_on and not self._removed:
+            await self._update_attrs_and_maybe_adapt_lights(
+                context=self.create_context("apple_source"),
+                transition=self._transition,
+            )
+
+    def _schedule_apple_brightness_change(
+        self,
+        event: Event[EventStateChangedData],
+    ) -> None:
+        """Coalesce external dimmer reports into a color-only adaptation."""
+        light = event.data[ATTR_ENTITY_ID]
+        old_state, new_state = event.data["old_state"], event.data["new_state"]
+        if (
+            not self.is_on
+            or self._removed
+            or not self._uses_apple_color
+            or old_state is None
+            or new_state is None
+            or old_state.state != STATE_ON
+            or new_state.state != STATE_ON
+            or old_state.attributes.get(ATTR_BRIGHTNESS)
+            == new_state.attributes.get(ATTR_BRIGHTNESS)
+            or is_our_context(event.context)
+            or self.manager.is_proactively_adapting(event.context.id)
+        ):
+            return
+        if remove := self._apple_brightness_timers.pop(light, None):
+            remove()
+        generation = self._apple_generation
+
+        async def adapt_color(_now: Any) -> None:
+            self._apple_brightness_timers.pop(light, None)
+            if (
+                not self.is_on
+                or self._removed
+                or light not in self.lights
+                or not is_on(self.hass, light)
+            ):
+                return
+            if not self._uses_apple_color:
+                return
+            context = self.create_context("apple_brightness", parent=event.context)
+            await self.manager.update_manually_controlled_from_untracked_change(
+                self,
+                light,
+                force=False,
+                context=context,
+            )
+            if not self.is_on or self._removed or generation != self._apple_generation:
+                return
+            await self._adapt_light(
+                light,
+                context,
+                transition=0,
+                adapt_brightness=False,
+            )
+
+        self._apple_brightness_timers[light] = async_call_later(
+            self.hass,
+            0.2,
+            adapt_color,
+        )
 
     async def _async_update_at_interval_action(
         self,
@@ -1305,6 +1457,49 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             force=False,
         )
 
+    def _apple_color_settings(
+        self,
+        light: str,
+        requested_brightness: float | None,
+        target_brightness: float | None,
+        transition: int,
+    ) -> dict[str, Any] | None:
+        """Evaluate color using the brightness this specific light will have."""
+        brightness = (
+            requested_brightness
+            if requested_brightness is not None
+            else target_brightness
+        )
+        state = self.hass.states.get(light)
+        if (
+            brightness is None
+            and state is not None
+            and state.state in (STATE_ON, STATE_OFF)
+        ):
+            brightness = state.attributes.get(ATTR_BRIGHTNESS)
+        if (
+            not isinstance(brightness, (int, float))
+            or isinstance(brightness, bool)
+            or not math.isfinite(brightness)
+            or not 0 < brightness <= 255
+        ):
+            return None
+        assert self._apple_source is not None
+        kelvin = self._apple_source.color_temperature(
+            100 * brightness / 255,
+            transition,
+        )
+        if kelvin is None:
+            return None
+        return {
+            **self._settings,
+            "color_temp_kelvin": kelvin,
+            "rgb_color": tuple(
+                round(value) for value in color_temperature_to_rgb(kelvin)
+            ),
+            "force_rgb_color": False,
+        }
+
     async def prepare_adaptation_data(
         self,
         light: str,
@@ -1315,6 +1510,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         force: bool = False,
         context: Context | None = None,
         already_applied: LightControlAttributes = LightControlAttributes.NONE,
+        requested_brightness: float | None = None,
     ) -> AdaptationData | None:
         """Prepare `AdaptationData` for adapting a light."""
         adaptation_attributes = self.manager.get_adaption_control_attributes(
@@ -1358,8 +1554,23 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             service_data[ATTR_TRANSITION] = transition
 
         if "brightness" in features and adapt_brightness:
-            brightness = round(255 * self._settings["brightness_pct"] / 100)
+            brightness = (
+                requested_brightness
+                if self._color_source == "apple" and requested_brightness is not None
+                else round(255 * self._settings["brightness_pct"] / 100)
+            )
             service_data[ATTR_BRIGHTNESS] = brightness
+
+        color_settings = self._settings
+        if self._uses_apple_color and adapt_color:
+            apple_settings = self._apple_color_settings(
+                light,
+                requested_brightness,
+                service_data.get(ATTR_BRIGHTNESS),
+                transition,
+            )
+            adapt_color = apple_settings is not None
+            color_settings = apple_settings or self._settings
 
         sleep_rgb = (
             self.sleep_mode_switch.is_on
@@ -1370,7 +1581,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             and adapt_color
             and not (prefer_rgb_color and "color" in features)
             and not (sleep_rgb and "color" in features)
-            and not (self._settings["force_rgb_color"] and "color" in features)
+            and not (color_settings["force_rgb_color"] and "color" in features)
         ):
             _LOGGER.debug("%s: Setting color_temp of light %s", self._name, light)
             state = self.hass.states.get(light)
@@ -1378,12 +1589,12 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             attributes = state.attributes
             min_kelvin = attributes["min_color_temp_kelvin"]
             max_kelvin = attributes["max_color_temp_kelvin"]
-            color_temp_kelvin = self._settings["color_temp_kelvin"]
+            color_temp_kelvin = color_settings["color_temp_kelvin"]
             color_temp_kelvin = clamp(color_temp_kelvin, min_kelvin, max_kelvin)
             service_data[ATTR_COLOR_TEMP_KELVIN] = color_temp_kelvin
         elif "color" in features and adapt_color:
             _LOGGER.debug("%s: Setting rgb_color of light %s", self._name, light)
-            service_data[ATTR_RGB_COLOR] = self._settings["rgb_color"]
+            service_data[ATTR_RGB_COLOR] = color_settings["rgb_color"]
 
         required_attrs = [ATTR_RGB_COLOR, ATTR_COLOR_TEMP_KELVIN, ATTR_BRIGHTNESS]
         if not any(attr in service_data for attr in required_attrs):
@@ -1420,6 +1631,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         adapt_color: bool | None = None,
         prefer_rgb_color: bool | None = None,
         force: bool = False,
+        requested_brightness: float | None = None,
     ) -> None:
         if (lock := self.manager.turn_off_locks.get(light)) and lock.locked():
             _LOGGER.debug("%s: '%s' is locked", self._name, light)
@@ -1433,6 +1645,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             prefer_rgb_color,
             force,
             context,
+            requested_brightness=requested_brightness,
         )
         if data is None:
             return  # nothing to adapt
@@ -1449,6 +1662,14 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 await asyncio.sleep(data.sleep_time)
 
             if self._removed:
+                return
+            if (
+                self._color_source == "apple"
+                and not self.is_on
+                and not is_our_context(data.context, "service")
+            ):
+                return
+            if self._apple_intercept_superseded(data):
                 return
 
             # Instead of directly iterating the generator in the while-loop, we get
@@ -1497,6 +1718,30 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 context=data.context,
             )
 
+    def _apple_intercept_superseded(self, data: AdaptationData) -> bool:
+        """Reject a queued first-frame follow-up after a newer user action.
+
+        A turn-off can arrive before the queued task starts and registers in
+        the manager's cancellation maps. The proactive context cannot authorize
+        turning the light back on in that case.
+        """
+        if self._color_source != "apple" or not data.initial_sleep:
+            return False
+        if not self.is_on:
+            return True
+        turn_on = self.manager.turn_on_event.get(data.entity_id)
+        if turn_on is None:
+            return False
+        if turn_on.context.id not in (data.context.id, data.context.parent_id):
+            return True
+        return any(
+            off is not None and off.time_fired > turn_on.time_fired
+            for off in (
+                self.manager.turn_off_event.get(data.entity_id),
+                self.manager.on_to_off_event.get(data.entity_id),
+            )
+        )
+
     async def execute_cancellable_adaptation_calls(
         self,
         data: AdaptationData,
@@ -1539,8 +1784,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         lights: list[str] | None = None,
         transition: int | None = None,
         force: bool = False,
+        requested_brightness: float | None = None,
     ) -> None:
         assert context is not None
+        apple_generation = self._apple_generation
         _LOGGER.debug(
             "%s: '_update_attrs_and_maybe_adapt_lights' called with context.id='%s'"
             " lights: '%s', transition: '%s', force: '%s'",
@@ -1612,12 +1859,18 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 force,
                 context,
             )
-
-            # Performance optimization: Skip adaptation task if all attributes are
-            # manually controlled and the task wouldn't actually do anything.
-            if self.manager.get_adaption_control_attributes(self, light).has_none():
+            # Recheck after polling: the profile may have been disabled while
+            # awaiting the light, or all attributes may now be manual.
+            if self.manager.get_adaption_control_attributes(self, light).has_none() or (
+                self._color_source == "apple"
+                and (
+                    not self.is_on
+                    or self._removed
+                    or apple_generation != self._apple_generation
+                )
+            ):
                 _LOGGER.debug(
-                    "%s: '%s' is being manually controlled, skip adaptation, context.id=%s.",
+                    "%s: '%s' cannot currently be adapted, context.id=%s.",
                     self._name,
                     light,
                     context.id,
@@ -1632,7 +1885,13 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 transition,
                 context.id,
             )
-            coro = self._adapt_light(light, context, transition, force=force)
+            coro = self._adapt_light(
+                light,
+                context,
+                transition,
+                force=force,
+                requested_brightness=requested_brightness,
+            )
             task = self.hass.async_create_task(
                 coro,
             )
@@ -1715,11 +1974,20 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         if self._removed or entity_id not in self.lights:
             return
 
+        requested_brightness = None
+        if self._color_source == "apple" and from_turn_on:
+            params = _apple_off_to_on_params(
+                self.hass,
+                self.manager.turn_on_event[entity_id].data[ATTR_SERVICE_DATA],
+            )
+            requested_brightness = params.get(ATTR_BRIGHTNESS)
+
         await self._update_attrs_and_maybe_adapt_lights(
             context=self.create_context("light_event", parent=event.context),
             lights=[entity_id],
             transition=self.initial_transition,
             force=True,
+            requested_brightness=requested_brightness,
         )
 
     async def _sleep_mode_switch_state_event_action(
@@ -2210,6 +2478,17 @@ class AdaptiveLightingManager:
                 has_intercepted = True
                 continue
 
+            if switch._color_source == "apple":
+                await self._service_interceptor_apple_handler(
+                    _entity_ids,
+                    switch,
+                    transition,
+                    call,
+                    deepcopy(service_data_copy),
+                    intercept_first=False,
+                )
+                continue
+
             for eid in _entity_ids:
                 # Must add a new context otherwise _adapt_light will bail out
                 context = switch.create_context("intercept", parent=call.context)
@@ -2257,6 +2536,15 @@ class AdaptiveLightingManager:
         call: ServiceCall,
         data: ServiceData,
     ):
+        if switch._color_source == "apple":
+            await self._service_interceptor_apple_handler(
+                entity_ids,
+                switch,
+                transition,
+                call,
+                data,
+            )
+            return
         _LOGGER.debug(
             "Intercepted TURN_ON call with data %s (%s)",
             data,
@@ -2331,6 +2619,78 @@ class AdaptiveLightingManager:
         # Remove tasks that are done
         if done_tasks := [t for t in self.adaptation_tasks if t.done()]:
             self.adaptation_tasks.difference_update(done_tasks)
+
+    async def _service_interceptor_apple_handler(
+        self,
+        entity_ids: list[str],
+        switch: AdaptiveSwitch,
+        transition: int,
+        call: ServiceCall,
+        data: ServiceData,
+        *,
+        intercept_first: bool = True,
+    ) -> None:
+        """Prepare independent first frames for brightness-dependent colors."""
+        original_params = _apple_off_to_on_params(self.hass, data[CONF_PARAMS])
+        requested_brightness = original_params.get(ATTR_BRIGHTNESS)
+        self.reset(*entity_ids, reset_manual_control=False)
+        pending: list[AdaptationData] = []
+        for index, entity_id in enumerate(entity_ids):
+            self.clear_proactively_adapting(entity_id)
+            context = switch.create_context("intercept", parent=call.context)
+            adaptation = None
+            if requested_brightness != 0:
+                adaptation = await switch.prepare_adaptation_data(
+                    entity_id,
+                    transition,
+                    context=context,
+                    requested_brightness=requested_brightness,
+                )
+            first = (
+                await adaptation.next_service_call_data()
+                if adaptation is not None
+                else None
+            )
+            params = dict(original_params)
+            if first:
+                first.pop(ATTR_ENTITY_ID, None)
+                preprocess_turn_on_alternatives(self.hass, first)
+                params.update(first)
+                self.last_service_data[entity_id] = {
+                    **self.last_service_data.get(entity_id, {}),
+                    **first,
+                }
+            if index == 0 and intercept_first:
+                data[ATTR_ENTITY_ID] = [entity_id]
+                data[CONF_PARAMS] = params
+                self.set_proactively_adapting(call.context.id, entity_id)
+            else:
+                self.set_proactively_adapting(context.id, entity_id)
+                external_params = dict(params)
+                if ATTR_COLOR_TEMP_KELVIN in external_params:
+                    # Older HA adds a legacy mired alias during preprocessing.
+                    # A fresh public service call must specify only one unit.
+                    external_params.pop("color_temp", None)
+                await self.hass.services.async_call(
+                    LIGHT_DOMAIN,
+                    SERVICE_TURN_ON,
+                    {ATTR_ENTITY_ID: entity_id, **external_params},
+                    blocking=True,
+                    context=context,
+                )
+            if adaptation is not None and first:
+                self.set_proactively_adapting(adaptation.context.id, entity_id)
+                adaptation.initial_sleep = True
+                pending.append(adaptation)
+        for adaptation in pending:
+            self.adaptation_tasks.add(
+                asyncio.create_task(
+                    switch.execute_cancellable_adaptation_calls(adaptation),
+                ),
+            )
+        self.adaptation_tasks.difference_update(
+            [task for task in self.adaptation_tasks if task.done()],
+        )
 
     def _handle_timer(
         self,
@@ -2833,6 +3193,14 @@ class AdaptiveLightingManager:
         if old_on and not new_on:
             # Availability loss invalidates pending commands, not manual state.
             self.cancel_ongoing_adaptation_calls(entity_id)
+
+        if old_on and new_on:
+            for switch in _switches_with_lights(
+                self.hass,
+                [entity_id],
+                expand_light_groups=False,
+            ):
+                switch._schedule_apple_brightness_change(event)
 
         if old_on and new_off:
             # Tracks 'on' → 'off' state changes

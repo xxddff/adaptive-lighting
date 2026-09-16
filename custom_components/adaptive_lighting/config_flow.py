@@ -10,12 +10,20 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
 
 from .const import (  # pylint: disable=unused-import
+    APPLE_CURVE_IDS,
+    APPLE_OPTIONS,
     BASIC_OPTIONS,
+    CONF_APPLE_CURVE_ID,
+    CONF_APPLE_PROBE_URL,
+    CONF_COLOR_SOURCE,
     CONF_LIGHTS,
+    DEFAULT_APPLE_CURVE_ID,
     DOMAIN,
     EXTRA_VALIDATION,
     NONE_STR,
     VALIDATION_TUPLES,
+    normalize_apple_probe_url,
+    validate_apple_settings,
 )
 from .switch import validate
 
@@ -88,6 +96,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is None:
             return self.async_abort(reason="no_data")
 
+        try:
+            user_input = validate_apple_settings(dict(user_input))
+        except vol.Invalid:
+            return self.async_abort(reason="invalid_apple_config")
+
         await self.async_set_unique_id(user_input[CONF_NAME])
         # Keep a list of switches that are configured via YAML
         data = self.hass.data.setdefault(DOMAIN, {})
@@ -129,6 +142,8 @@ def validate_options(user_input: dict[str, Any], errors: dict[str, str]) -> None
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle a option flow for Adaptive Lighting."""
 
+    _pending_options: dict[str, Any] | None = None
+
     def _flatten_section_input(self, user_input: dict[str, Any]) -> dict[str, Any]:
         """Flatten section input by merging nested 'advanced' dict into top level."""
         flat_input: dict[str, Any] = {}
@@ -152,9 +167,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             )
         errors: dict[str, str] = {}
         if user_input is not None:
-            flat_input = self._flatten_section_input(user_input)
+            flat_input = {
+                **conf.options,
+                **{key: form_data[key] for key in APPLE_OPTIONS if key in form_data},
+                **self._flatten_section_input(user_input),
+            }
             validate_options(flat_input, errors)
             if not errors:
+                if flat_input.get(CONF_COLOR_SOURCE, "sun") == "apple":
+                    self._pending_options = flat_input
+                    return await self.async_step_apple()
                 return self.async_create_entry(title="", data=flat_input)
             data.update(flat_input)
             form_data.update(flat_input)
@@ -182,6 +204,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         basic_schema: dict[vol.Marker, Any] = {}
         advanced_schema: dict[vol.Marker, Any] = {}
         for name, default, validation in VALIDATION_TUPLES:
+            if name in APPLE_OPTIONS:
+                continue
             key = vol.Optional(name, default=form_data.get(name, default))
             schema = basic_schema if name in BASIC_OPTIONS else advanced_schema
             schema[key] = to_replace.get(name, validation)
@@ -199,4 +223,38 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             data_schema=vol.Schema(full_schema),
             errors=errors,
             description_placeholders=OPTIONS_FLOW_DESCRIPTION_PLACEHOLDERS,
+        )
+
+    async def async_step_apple(self, user_input: dict[str, Any] | None = None):
+        """Choose a probe and an explicit curve without requiring it to be online."""
+        assert self._pending_options is not None
+        data = dict(self._pending_options)
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            data.update(user_input)
+            try:
+                data[CONF_APPLE_PROBE_URL] = normalize_apple_probe_url(
+                    data.get(CONF_APPLE_PROBE_URL, ""),
+                )
+            except vol.Invalid:
+                errors[CONF_APPLE_PROBE_URL] = "invalid_probe_url"
+            if data.get(CONF_APPLE_CURVE_ID) not in APPLE_CURVE_IDS:
+                errors[CONF_APPLE_CURVE_ID] = "invalid_curve_id"
+            if not errors:
+                return self.async_create_entry(title="", data=data)
+        return self.async_show_form(
+            step_id="apple",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_APPLE_PROBE_URL,
+                        default=data.get(CONF_APPLE_PROBE_URL, ""),
+                    ): str,
+                    vol.Required(
+                        CONF_APPLE_CURVE_ID,
+                        default=data.get(CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID),
+                    ): vol.In(APPLE_CURVE_IDS),
+                },
+            ),
+            errors=errors,
         )

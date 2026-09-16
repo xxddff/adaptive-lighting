@@ -17,7 +17,8 @@
       }
     },
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "invalid_apple_config": "Invalid Apple curve configuration."
     }
   },
   "options": {
@@ -26,6 +27,7 @@
         "title": "Adaptive Lighting options",
         "description": "Configure an Adaptive Lighting component. Option names align with the YAML settings. If you've defined this entry in YAML, no options will appear here. For interactive graphs that demonstrate parameter effects, visit [this web app]({webapp_url}). For further details, see the [official documentation]({docs_url}).",
         "data": {
+          "color_source": "color_source",
           "lights": "lights: List of light entity_ids to be controlled (may be empty). 🌟",
           "interval": "interval",
           "transition": "transition",
@@ -37,6 +39,7 @@
           "sleep_color_temp": "sleep_color_temp"
         },
         "data_description": {
+          "color_source": "Use the sun algorithm or a captured Apple color-temperature plan.",
           "interval": "Frequency to adapt the lights, in seconds. 🔄",
           "transition": "Duration of transition when lights change, in seconds. 🕑",
           "sleep_brightness": "Brightness percentage of lights in sleep mode. 😴",
@@ -104,11 +107,21 @@
             }
           }
         }
+      },
+      "apple": {
+        "title": "Apple curve source",
+        "description": "Enter the probe base URL reachable from Home Assistant and choose the virtual light ID. The probe does not need to be online to save these settings.",
+        "data": {
+          "apple_probe_url": "Probe base URL",
+          "apple_curve_id": "Curve ID"
+        }
       }
     },
     "error": {
       "option_error": "Invalid option",
-      "entity_missing": "One or more selected light entities are missing from Home Assistant"
+      "entity_missing": "One or more selected light entities are missing from Home Assistant",
+      "invalid_probe_url": "Enter an HTTP(S) base URL without credentials, a query or a fragment.",
+      "invalid_curve_id": "Choose one of the three supported curve IDs."
     }
   },
   "services": {

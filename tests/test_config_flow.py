@@ -10,7 +10,12 @@ try:
 except ImportError:
     from voluptuous_serialize import convert as to_field_list
 from homeassistant.components.adaptive_lighting.const import (
+    _DOMAIN_SCHEMA,
+    APPLE_OPTIONS,
     BASIC_OPTIONS,
+    CONF_APPLE_CURVE_ID,
+    CONF_APPLE_PROBE_URL,
+    CONF_COLOR_SOURCE,
     CONF_EXPAND_LIGHT_GROUPS,
     CONF_INITIAL_TRANSITION,
     CONF_MANUAL_CONTROL_ON_EXTERNAL_TURN_ON,
@@ -21,6 +26,8 @@ from homeassistant.components.adaptive_lighting.const import (
     DOMAIN,
     NONE_STR,
     VALIDATION_TUPLES,
+    change_switch_settings_schema,
+    normalize_apple_probe_url,
 )
 from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_NAME
@@ -34,7 +41,9 @@ DEFAULT_DATA = {key: default for key, default, _ in VALIDATION_TUPLES}
 # Split DEFAULT_DATA into basic and advanced for section-based input
 BASIC_DATA = {key: value for key, value in DEFAULT_DATA.items() if key in BASIC_OPTIONS}
 ADVANCED_DATA = {
-    key: value for key, value in DEFAULT_DATA.items() if key not in BASIC_OPTIONS
+    key: value
+    for key, value in DEFAULT_DATA.items()
+    if key not in BASIC_OPTIONS | APPLE_OPTIONS
 }
 
 
@@ -160,7 +169,7 @@ async def test_options_schema_has_each_setting_once(hass):
     assert {key.schema for key in schema if key.schema != "advanced"} == BASIC_OPTIONS
     assert {key.schema for key in advanced.schema.schema} == set(
         DEFAULT_DATA,
-    ) - BASIC_OPTIONS
+    ) - BASIC_OPTIONS - APPLE_OPTIONS
     assert _schema_defaults(result["data_schema"])["interval"] == 120
     assert _schema_defaults(result["data_schema"])["min_brightness"] == 12
 
@@ -176,7 +185,7 @@ async def test_options_schema_has_each_setting_once(hass):
     assert serialized_advanced["expanded"] is False
     assert {field["name"] for field in serialized_advanced["schema"]} == set(
         DEFAULT_DATA,
-    ) - BASIC_OPTIONS
+    ) - BASIC_OPTIONS - APPLE_OPTIONS
 
 
 @pytest.mark.parametrize("lights", [[], ["light.missing"]])
@@ -369,3 +378,133 @@ async def test_menu_duplicate_instance(hass):
     assert result["title"] == "duplicated"
     # Duplicated instance should have copied options
     assert result["options"] == source_options
+
+
+async def test_apple_options_second_step_preserves_settings_without_network(hass):
+    """Choose a fixed curve in a conditional second step without connecting."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=DEFAULT_NAME,
+        data={CONF_NAME: DEFAULT_NAME},
+        options={"min_brightness": 12, "transition": 17},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert CONF_APPLE_PROBE_URL not in _schema_defaults(result["data_schema"])
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_COLOR_SOURCE: "apple", "advanced": {}},
+    )
+    assert result["step_id"] == "apple"
+    assert set(result["data_schema"].schema) == APPLE_OPTIONS
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_APPLE_PROBE_URL: "http://Probe.Example:80/",
+            CONF_APPLE_CURVE_ID: "ikea-matter",
+        },
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_APPLE_PROBE_URL] == "http://probe.example"
+    assert result["data"][CONF_APPLE_CURVE_ID] == "ikea-matter"
+    assert result["data"]["min_brightness"] == 12
+    assert result["data"]["transition"] == 17
+
+
+async def test_apple_options_invalid_url_can_be_corrected(hass):
+    """An invalid address keeps the second step and previous settings."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=DEFAULT_NAME,
+        data={CONF_NAME: DEFAULT_NAME},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_COLOR_SOURCE: "apple", "min_brightness": 25, "advanced": {}},
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_APPLE_PROBE_URL: "not-a-url", CONF_APPLE_CURVE_ID: "yeelight"},
+    )
+    assert result["step_id"] == "apple"
+    assert result["errors"] == {CONF_APPLE_PROBE_URL: "invalid_probe_url"}
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_APPLE_PROBE_URL: "http://probe.example:8787",
+            CONF_APPLE_CURVE_ID: "yeelight",
+        },
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"]["min_brightness"] == 25
+
+
+async def test_sun_options_preserve_hidden_apple_settings(hass):
+    """Switching to sun does not discard the address and explicit curve choice."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=DEFAULT_NAME,
+        data={CONF_NAME: DEFAULT_NAME},
+        options={
+            CONF_COLOR_SOURCE: "apple",
+            CONF_APPLE_PROBE_URL: "http://probe.example:8787",
+            CONF_APPLE_CURVE_ID: "ikea-zigbee",
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_COLOR_SOURCE: "sun", "advanced": {}},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_COLOR_SOURCE] == "sun"
+    assert result["data"][CONF_APPLE_CURVE_ID] == "ikea-zigbee"
+    assert result["data"][CONF_APPLE_PROBE_URL] == "http://probe.example:8787"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "localhost:8787",
+        "ftp://probe",
+        "http://u:p@probe",
+        "http://probe?x=1",
+        "http://probe/#fragment",
+        "http://probe:0",
+        "http://probe:99999",
+        "http://pro be",
+    ],
+)
+def test_apple_url_validation(url):
+    """Reject malformed or ambiguous probe addresses before runtime."""
+    with pytest.raises(vol.Invalid):
+        normalize_apple_probe_url(url)
+
+
+def test_apple_yaml_and_runtime_configuration_boundaries():
+    """YAML requires the Apple address; runtime changes remain reload-only."""
+    assert _DOMAIN_SCHEMA({})[CONF_COLOR_SOURCE] == "sun"
+    with pytest.raises(vol.Invalid):
+        _DOMAIN_SCHEMA({CONF_COLOR_SOURCE: "apple"})
+    result = _DOMAIN_SCHEMA(
+        {
+            CONF_COLOR_SOURCE: "apple",
+            CONF_APPLE_PROBE_URL: "http://[::1]:8787/",
+            CONF_APPLE_CURVE_ID: "ikea-zigbee",
+        },
+    )
+    assert result[CONF_APPLE_PROBE_URL] == "http://[::1]:8787"
+    with pytest.raises(vol.Invalid):
+        _DOMAIN_SCHEMA(
+            {
+                CONF_COLOR_SOURCE: "apple",
+                CONF_APPLE_PROBE_URL: "http://probe",
+                CONF_APPLE_CURVE_ID: "automatic",
+            },
+        )
+    service_fields = {key.schema for key in change_switch_settings_schema()}
+    assert not service_fields.intersection(APPLE_OPTIONS | {CONF_COLOR_SOURCE})

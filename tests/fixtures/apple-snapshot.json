@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "lightId": "ikea-matter",
+  "serverTimeMillis": 1767227195000,
+  "protocolEnabled": true,
+  "phase": "active",
+  "source": {
+    "protocol": "HAP",
+    "parser": "@homebridge/hap-nodejs",
+    "parserVersion": "2.2.3",
+    "lightId": "ikea-matter",
+    "lightName": "Synthetic fixture",
+    "requestedColorTemperature": {
+      "minKelvin": 2202,
+      "maxKelvin": 6536
+    },
+    "advertisedColorTemperature": {
+      "minMired": 153,
+      "maxMired": 454
+    }
+  },
+  "schedule": {
+    "transitionStartMillis": 1767225600000,
+    "timeMillisOffset": -5000,
+    "transitionCurve": [
+      {
+        "temperature": 400.25,
+        "brightnessAdjustmentFactor": -0.5,
+        "transitionTime": 0,
+        "duration": 600000
+      },
+      {
+        "temperature": 360.5,
+        "brightnessAdjustmentFactor": -0.25,
+        "transitionTime": 3600000
+      },
+      {
+        "temperature": 390.75,
+        "brightnessAdjustmentFactor": -0.375,
+        "transitionTime": 3600000
+      }
+    ],
+    "brightnessAdjustmentRange": {
+      "minBrightnessValue": 10,
+      "maxBrightnessValue": 100
+    },
+    "updateInterval": 60000,
+    "notifyIntervalThreshold": 600000
+  },
+  "planId": "4f7087b9c11a95657db43ee7ffd814315bc349cd6dde7b3a2fe43d5a3dd12285",
+  "receivedAt": "2026-01-01T00:26:35.000Z",
+  "effectiveStartMillis": 1767225595000,
+  "validFromMillis": 1767225595000,
+  "validUntilMillis": 1767233395000
+}
