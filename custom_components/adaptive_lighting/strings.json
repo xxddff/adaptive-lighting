@@ -110,9 +110,23 @@
       },
       "apple": {
         "title": "Apple curve source",
-        "description": "Enter the probe base URL reachable from Home Assistant and choose the virtual light ID. The probe does not need to be online to save these settings.",
+        "description": "Enter the base URL of the Apple Curve Probe as reachable from Home Assistant, for example {example_url}. Home Assistant then asks the probe which virtual lights it has so you can pick one. If the probe is offline, you can still enter the curve ID by hand in the next step.",
         "data": {
-          "apple_probe_url": "Probe base URL",
+          "apple_probe_url": "Probe base URL"
+        }
+      },
+      "apple_offline": {
+        "title": "Probe not reachable",
+        "description": "The list of virtual lights could not be loaded from {url} ({error}). Correct the address, or continue and enter the curve ID by hand.",
+        "menu_options": {
+          "apple": "Change the address",
+          "apple_curve": "Enter the curve ID by hand"
+        }
+      },
+      "apple_curve": {
+        "title": "Apple curve",
+        "description": "Choose the virtual light on {url} whose Apple plan should control these lights, or type the ID of a light that does not exist yet. IDs consist of 1–32 lowercase letters, digits or hyphens, exactly as entered on the probe. Lights marked “not paired” have not been added to Apple Home yet.",
+        "data": {
           "apple_curve_id": "Curve ID"
         }
       }
@@ -121,7 +135,8 @@
       "option_error": "Invalid option",
       "entity_missing": "One or more selected light entities are missing from Home Assistant",
       "invalid_probe_url": "Enter an HTTP(S) base URL without credentials, a query or a fragment.",
-      "invalid_curve_id": "Choose one of the three supported curve IDs."
+      "invalid_curve_id": "Enter a curve ID of 1–32 lowercase letters, digits or hyphens.",
+      "catalog_empty": "The probe has no virtual lights yet. Create one on the probe's web page, or type the ID you will give it."
     }
   },
   "services": {

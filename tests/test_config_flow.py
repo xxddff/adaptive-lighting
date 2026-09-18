@@ -1,7 +1,9 @@
 """Test Adaptive Lighting config flow."""
 
 import json
+from unittest.mock import MagicMock, patch
 
+import aiohttp
 import pytest
 import voluptuous as vol
 
@@ -9,6 +11,10 @@ try:
     from probatio import to_field_list
 except ImportError:
     from voluptuous_serialize import convert as to_field_list
+from homeassistant.components.adaptive_lighting import apple_source
+from homeassistant.components.adaptive_lighting.config_flow import (
+    describe_apple_light,
+)
 from homeassistant.components.adaptive_lighting.const import (
     _DOMAIN_SCHEMA,
     APPLE_OPTIONS,
@@ -27,14 +33,39 @@ from homeassistant.components.adaptive_lighting.const import (
     NONE_STR,
     VALIDATION_TUPLES,
     change_switch_settings_schema,
+    normalize_apple_curve_id,
     normalize_apple_probe_url,
 )
 from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import CONF_NAME
 from homeassistant.data_entry_flow import FlowResultType, section
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import SelectSelector
 
 from tests.common import MockConfigEntry
+
+from .test_apple_source import Response
+
+CATALOG = {
+    "lights": [
+        {
+            "id": "living-room",
+            "name": "Apple Curve Probe 客厅吊灯",
+            "label": "客厅吊灯",
+            "paired": True,
+            "minKelvin": 2700,
+            "maxKelvin": 6500,
+        },
+        {
+            "id": "ikea-zigbee",
+            "name": "Apple Curve Probe ikea-zigbee",
+            "label": "ikea-zigbee",
+            "paired": False,
+            "minKelvin": 2202,
+            "maxKelvin": 4000,
+        },
+    ],
+}
 
 DEFAULT_DATA = {key: default for key, default, _ in VALIDATION_TUPLES}
 
@@ -380,13 +411,23 @@ async def test_menu_duplicate_instance(hass):
     assert result["options"] == source_options
 
 
-async def test_apple_options_second_step_preserves_settings_without_network(hass):
-    """Choose a fixed curve in a conditional second step without connecting."""
+def _probe_session(reply):
+    """Return an aiohttp-like session whose GET answers with reply or raises it."""
+    session = MagicMock()
+    if isinstance(reply, BaseException):
+        session.get.side_effect = reply
+    else:
+        session.get.side_effect = lambda *_args, **_kwargs: Response(reply)
+    return session
+
+
+async def _start_apple_options(hass, options=None, session=None):
+    """Open the options flow, choose the Apple source and reach the address step."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         title=DEFAULT_NAME,
         data={CONF_NAME: DEFAULT_NAME},
-        options={"min_brightness": 12, "transition": 17},
+        options=options or {},
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -395,50 +436,263 @@ async def test_apple_options_second_step_preserves_settings_without_network(hass
         result["flow_id"],
         user_input={CONF_COLOR_SOURCE: "apple", "advanced": {}},
     )
+    assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "apple"
-    assert set(result["data_schema"].schema) == APPLE_OPTIONS
+    assert set(result["data_schema"].schema) == {CONF_APPLE_PROBE_URL}
+    if session is not None:
+        assert not session.get.called
+    return result
+
+
+def _curve_selector(result):
+    """Return the curve ID field's validator from an apple_curve form."""
+    assert result["step_id"] == "apple_curve"
+    assert set(result["data_schema"].schema) == {CONF_APPLE_CURVE_ID}
+    return next(iter(result["data_schema"].schema.values()))
+
+
+async def test_apple_options_list_probe_lights_to_choose_from(hass):
+    """The address step loads the probe's lights and offers them as a dropdown."""
+    session = _probe_session(CATALOG)
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        result = await _start_apple_options(
+            hass,
+            {"min_brightness": 12, "transition": 17},
+            session,
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://Probe.Example:80/"},
+        )
+    assert session.get.call_args.args[0] == "http://probe.example/api/catalog"
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {}
+    assert result["description_placeholders"] == {"url": "http://probe.example"}
+    selector = _curve_selector(result)
+    assert isinstance(selector, SelectSelector)
+    assert selector.config["custom_value"] is True
+    assert selector.config["options"] == [
+        {
+            "value": "living-room",
+            "label": "客厅吊灯 (living-room) \u00b7 2700\u20136500 K",
+        },
+        {
+            "value": "ikea-zigbee",
+            "label": "ikea-zigbee \u00b7 2202\u20134000 K \u00b7 not paired",
+        },
+    ]
+    # Nothing is preselected before a curve was ever chosen.
+    assert _schema_defaults(result["data_schema"]) == {
+        CONF_APPLE_CURVE_ID: vol.UNDEFINED,
+    }
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        user_input={
-            CONF_APPLE_PROBE_URL: "http://Probe.Example:80/",
-            CONF_APPLE_CURVE_ID: "ikea-matter",
-        },
+        user_input={CONF_APPLE_CURVE_ID: "living-room"},
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_COLOR_SOURCE] == "apple"
     assert result["data"][CONF_APPLE_PROBE_URL] == "http://probe.example"
-    assert result["data"][CONF_APPLE_CURVE_ID] == "ikea-matter"
+    assert result["data"][CONF_APPLE_CURVE_ID] == "living-room"
     assert result["data"]["min_brightness"] == 12
     assert result["data"]["transition"] == 17
+    assert session.get.call_count == 1
+
+
+async def test_apple_options_preselect_saved_curve_and_accept_unlisted_id(hass):
+    """A saved ID stays selected, and an ID missing from the list is still accepted."""
+    session = _probe_session(CATALOG)
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        result = await _start_apple_options(
+            hass,
+            {
+                CONF_COLOR_SOURCE: "apple",
+                CONF_APPLE_PROBE_URL: "http://probe.example:8787",
+                CONF_APPLE_CURVE_ID: "ikea-zigbee",
+            },
+        )
+        assert _schema_defaults(result["data_schema"]) == {
+            CONF_APPLE_PROBE_URL: "http://probe.example:8787",
+        }
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://probe.example:8787"},
+        )
+    assert _schema_defaults(result["data_schema"]) == {
+        CONF_APPLE_CURVE_ID: "ikea-zigbee",
+    }
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_APPLE_CURVE_ID: " bedroom-new "},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_APPLE_CURVE_ID] == "bedroom-new"
+
+
+async def test_apple_options_invalid_curve_id_can_be_corrected(hass):
+    """An ID the probe would reject keeps the curve step with the typed value."""
+    session = _probe_session(CATALOG)
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        result = await _start_apple_options(hass)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://probe.example:8787"},
+        )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_APPLE_CURVE_ID: "Living Room"},
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {CONF_APPLE_CURVE_ID: "invalid_curve_id"}
+    assert isinstance(_curve_selector(result), SelectSelector)
+    assert _schema_defaults(result["data_schema"]) == {
+        CONF_APPLE_CURVE_ID: "Living Room",
+    }
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_APPLE_CURVE_ID: "living-room"},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_APPLE_CURVE_ID] == "living-room"
+    assert session.get.call_count == 1
+
+
+async def test_apple_options_empty_catalog_falls_back_to_text_entry(hass):
+    """A probe without lights shows a notice and a plain text field."""
+    session = _probe_session({"lights": []})
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        result = await _start_apple_options(hass)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://probe.example:8787"},
+        )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "catalog_empty"}
+    assert _curve_selector(result) is str
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_APPLE_CURVE_ID: "kitchen"},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_APPLE_CURVE_ID] == "kitchen"
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        (aiohttp.ClientError("refused"), "connection failed"),
+        (TimeoutError(), "timed out"),
+    ],
+)
+async def test_apple_options_offline_probe_allows_manual_id(hass, reply, error):
+    """An unreachable probe offers a menu; the ID can still be typed and saved."""
+    session = _probe_session(reply)
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        result = await _start_apple_options(hass, {"min_brightness": 25})
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://probe.example:8787"},
+        )
+    assert result["type"] == FlowResultType.MENU
+    assert result["step_id"] == "apple_offline"
+    assert result["menu_options"] == ["apple", "apple_curve"]
+    assert result["description_placeholders"] == {
+        "url": "http://probe.example:8787",
+        "error": error,
+    }
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={"next_step_id": "apple_curve"},
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {}
+    assert _curve_selector(result) is str
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_APPLE_CURVE_ID: "ikea-matter"},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_APPLE_PROBE_URL] == "http://probe.example:8787"
+    assert result["data"][CONF_APPLE_CURVE_ID] == "ikea-matter"
+    assert result["data"]["min_brightness"] == 25
+
+
+async def test_apple_options_offline_menu_returns_to_address_step(hass):
+    """Choosing to fix the address shows it again and retries loading the lights."""
+    session = _probe_session(CATALOG)
+    session.get.side_effect = [
+        aiohttp.ClientError("refused"),
+        Response(CATALOG),
+    ]
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        result = await _start_apple_options(hass)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://wrong.example:8787"},
+        )
+        assert result["type"] == FlowResultType.MENU
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={"next_step_id": "apple"},
+        )
+        assert result["type"] == FlowResultType.FORM
+        assert result["step_id"] == "apple"
+        assert _schema_defaults(result["data_schema"]) == {
+            CONF_APPLE_PROBE_URL: "http://wrong.example:8787",
+        }
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://probe.example:8787"},
+        )
+    assert session.get.call_count == 2
+    assert session.get.call_args.args[0] == "http://probe.example:8787/api/catalog"
+    assert result["type"] == FlowResultType.FORM
+    assert isinstance(_curve_selector(result), SelectSelector)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_APPLE_CURVE_ID: "living-room"},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_APPLE_PROBE_URL] == "http://probe.example:8787"
 
 
 async def test_apple_options_invalid_url_can_be_corrected(hass):
-    """An invalid address keeps the second step and previous settings."""
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        title=DEFAULT_NAME,
-        data={CONF_NAME: DEFAULT_NAME},
-    )
-    entry.add_to_hass(hass)
-    result = await hass.config_entries.options.async_init(entry.entry_id)
+    """An invalid address keeps the address step without contacting anything."""
+    session = _probe_session(CATALOG)
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        result = await _start_apple_options(hass, {"min_brightness": 25})
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "not-a-url"},
+        )
+        assert result["type"] == FlowResultType.FORM
+        assert result["step_id"] == "apple"
+        assert result["errors"] == {CONF_APPLE_PROBE_URL: "invalid_probe_url"}
+        assert _schema_defaults(result["data_schema"]) == {
+            CONF_APPLE_PROBE_URL: "not-a-url",
+        }
+        assert not session.get.called
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_APPLE_PROBE_URL: "http://probe.example:8787"},
+        )
+    assert result["step_id"] == "apple_curve"
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        user_input={CONF_COLOR_SOURCE: "apple", "min_brightness": 25, "advanced": {}},
-    )
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={CONF_APPLE_PROBE_URL: "not-a-url", CONF_APPLE_CURVE_ID: "yeelight"},
-    )
-    assert result["step_id"] == "apple"
-    assert result["errors"] == {CONF_APPLE_PROBE_URL: "invalid_probe_url"}
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={
-            CONF_APPLE_PROBE_URL: "http://probe.example:8787",
-            CONF_APPLE_CURVE_ID: "yeelight",
-        },
+        user_input={CONF_APPLE_CURVE_ID: "yeelight"},
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert result["data"]["min_brightness"] == 25
+
+
+def test_describe_apple_light_labels():
+    """Dropdown labels carry the name, ID, Kelvin range and pairing state."""
+    light = apple_source.AppleCatalogLight("hall", "hall", True, None, None)
+    assert describe_apple_light(light) == "hall"
+    light = apple_source.AppleCatalogLight("hall", "Hallway", False, 2000, 6500)
+    assert (
+        describe_apple_light(light)
+        == "Hallway (hall) \u00b7 2000\u20136500 K \u00b7 not paired"
+    )
 
 
 async def test_sun_options_preserve_hidden_apple_settings(hass):
@@ -485,25 +739,55 @@ def test_apple_url_validation(url):
         normalize_apple_probe_url(url)
 
 
+@pytest.mark.parametrize(
+    ("curve_id", "expected"),
+    [
+        ("a", "a"),
+        ("living-room", "living-room"),
+        (" ikea-zigbee\n", "ikea-zigbee"),
+        ("a" * 32, "a" * 32),
+    ],
+)
+def test_apple_curve_id_normalization(curve_id, expected):
+    """Accept exactly the identifiers the probe accepts, ignoring surrounding space."""
+    assert normalize_apple_curve_id(curve_id) == expected
+
+
+@pytest.mark.parametrize(
+    "curve_id",
+    ["", "   ", "Living", "living room", "living_room", "客厅", "a" * 33, None, 5],
+)
+def test_apple_curve_id_validation(curve_id):
+    """Reject identifiers the probe could never publish."""
+    with pytest.raises(vol.Invalid):
+        normalize_apple_curve_id(curve_id)
+
+
 def test_apple_yaml_and_runtime_configuration_boundaries():
-    """YAML requires the Apple address; runtime changes remain reload-only."""
+    """YAML requires the Apple address and ID; runtime changes remain reload-only."""
     assert _DOMAIN_SCHEMA({})[CONF_COLOR_SOURCE] == "sun"
+    assert _DOMAIN_SCHEMA({})[CONF_APPLE_CURVE_ID] == ""
     with pytest.raises(vol.Invalid):
         _DOMAIN_SCHEMA({CONF_COLOR_SOURCE: "apple"})
+    with pytest.raises(vol.Invalid):
+        _DOMAIN_SCHEMA(
+            {CONF_COLOR_SOURCE: "apple", CONF_APPLE_PROBE_URL: "http://probe"},
+        )
     result = _DOMAIN_SCHEMA(
         {
             CONF_COLOR_SOURCE: "apple",
             CONF_APPLE_PROBE_URL: "http://[::1]:8787/",
-            CONF_APPLE_CURVE_ID: "ikea-zigbee",
+            CONF_APPLE_CURVE_ID: " bedroom-2 ",
         },
     )
     assert result[CONF_APPLE_PROBE_URL] == "http://[::1]:8787"
+    assert result[CONF_APPLE_CURVE_ID] == "bedroom-2"
     with pytest.raises(vol.Invalid):
         _DOMAIN_SCHEMA(
             {
                 CONF_COLOR_SOURCE: "apple",
                 CONF_APPLE_PROBE_URL: "http://probe",
-                CONF_APPLE_CURVE_ID: "automatic",
+                CONF_APPLE_CURVE_ID: "Bedroom 2",
             },
         )
     service_fields = {key.schema for key in change_switch_settings_schema()}

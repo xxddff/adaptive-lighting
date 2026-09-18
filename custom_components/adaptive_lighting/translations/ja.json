@@ -49,16 +49,31 @@
       },
       "apple": {
         "title": "Apple カーブの取得元",
-        "description": "Home Assistant からアクセスできるプローブのベース URL と仮想ライト ID を指定します。プローブがオフラインでも保存できます。",
+        "description": "Home Assistant からアクセスできるプローブのベース URL を入力します（例: {example_url}）。Home Assistant はプローブに仮想ライトの一覧を問い合わせ、次の手順で選択できるようにします。プローブがオフラインでも、次の手順でカーブ ID を手動入力できます。",
         "data": {
-          "apple_probe_url": "プローブのベース URL",
+          "apple_probe_url": "プローブのベース URL"
+        }
+      },
+      "apple_offline": {
+        "title": "プローブに接続できません",
+        "description": "{url} から仮想ライトの一覧を読み込めませんでした（{error}）。アドレスを修正するか、続行してカーブ ID を手動で入力してください。",
+        "menu_options": {
+          "apple": "アドレスを変更する",
+          "apple_curve": "カーブ ID を手動で入力する"
+        }
+      },
+      "apple_curve": {
+        "title": "Apple カーブ",
+        "description": "{url} の仮想ライトから、これらのライトを制御する Apple のプランを持つものを選ぶか、まだ作成していないライトの ID を入力します。ID はプローブで入力したとおりの 1〜32 文字の小文字英字、数字、ハイフンです。「not paired」と表示されたライトはまだ Apple Home に追加されていません。",
+        "data": {
           "apple_curve_id": "カーブ ID"
         }
       }
     },
     "error": {
       "invalid_probe_url": "認証情報、クエリ、フラグメントを含まない HTTP(S) のベース URL を入力してください。",
-      "invalid_curve_id": "対応する 3 種類のカーブ ID から選択してください。"
+      "invalid_curve_id": "1〜32 文字の小文字英字、数字、ハイフンからなるカーブ ID を入力してください。",
+      "catalog_empty": "プローブにはまだ仮想ライトがありません。プローブのウェブページで作成するか、使用する予定の ID を入力してください。"
     }
   },
   "config": {
