@@ -462,7 +462,7 @@ async def test_apple_options_list_probe_lights_to_choose_from(hass):
         )
         result = await hass.config_entries.options.async_configure(
             result["flow_id"],
-            user_input={CONF_APPLE_PROBE_URL: "http://Probe.Example:80/"},
+            user_input={CONF_APPLE_PROBE_URL: " http://Probe.Example:80/ "},
         )
     assert session.get.call_args.args[0] == "http://probe.example/api/catalog"
     assert result["type"] == FlowResultType.FORM
