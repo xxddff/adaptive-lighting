@@ -54,7 +54,8 @@ DOCS[CONF_APPLE_CURVE_ID] = (
 def normalize_apple_probe_url(value: str) -> str:
     """Validate and normalize a probe base URL without making a request."""
     try:
-        parsed = urlsplit(value.strip())
+        value = value.strip()
+        parsed = urlsplit(value)
         port = parsed.port
         host = parsed.hostname
         if (

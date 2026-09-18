@@ -48,6 +48,8 @@ async def source_env(hass):
             self.key = key
 
         async def async_load(self):
+            # Yield like the executor-backed store so activations can overlap.
+            await asyncio.sleep(0)
             return copy.deepcopy(stored.get(self.key))
 
         async def async_save(self, data):
@@ -84,10 +86,14 @@ async def test_shared_source_valid_cache_zero_poll_and_target_clamp(hass, source
     assert session.get.call_count == 0
     callback = AsyncMock()
     await source.async_add_listener("one", "Room one", callback)
-    await source.async_add_listener("two", "Room two", AsyncMock())
+    second = AsyncMock()
+    await source.async_add_listener("two", "Room two", second)
     assert session.get.call_count == 1
     assert source.uses_apple
-    assert callback.await_count == 2
+    # The first activation publishes the plan; joining an unchanged plan does
+    # not republish it to anyone.
+    assert callback.await_count == 1
+    assert not second.called
     assert not create.called
     assert source.color_temperature(20) != source.color_temperature(90)
     assert source.color_temperature(50, 100_000) == source._current.curve.kelvin(
@@ -259,7 +265,8 @@ async def test_cancel_inflight_request_and_stale_result(hass, source_env):
     await asyncio.sleep(0)
     assert session.get.call_count == 1
     await source.async_remove_listener("one")
-    await asyncio.gather(activation, return_exceptions=True)
+    # Deactivation cancels the shared request without raising into the caller.
+    await activation
     assert not source.uses_apple
     assert source._timer is None
     assert not listener.called
@@ -444,12 +451,131 @@ async def test_cached_future_plan_survives_restart(hass, source_env):
 async def test_one_listener_failure_does_not_stop_other_owner_or_timer(source_env):
     source, _now, _snapshot, _session, _create, _dismiss, _stored = source_env
     good = AsyncMock()
-    await source.async_add_listener("one", "Room", good)
-    await source.async_add_listener(
-        "two",
-        "Room two",
-        AsyncMock(side_effect=RuntimeError("listener failed")),
+    bad = AsyncMock(side_effect=RuntimeError("listener failed"))
+    await asyncio.gather(
+        source.async_add_listener("one", "Room", good),
+        source.async_add_listener("two", "Room two", bad),
     )
     assert source.uses_apple
-    assert good.await_count == 2
+    assert good.await_count == 1
+    assert bad.await_count == 1
     assert source._timer is not None
+
+
+async def test_caller_cancellation_keeps_shared_request_for_other_owner(
+    hass,
+    source_env,
+):
+    source, _now, snapshot, session, _create, _dismiss, _stored = source_env
+    pending = hass.loop.create_future()
+    session.get.side_effect = lambda *_args, **_kwargs: Response(pending)
+    first = asyncio.create_task(source.async_add_listener("one", "Room", AsyncMock()))
+    listener = AsyncMock()
+    second = asyncio.create_task(
+        source.async_add_listener("two", "Room two", listener),
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert session.get.call_count == 1
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    assert first.cancelled()
+    pending.set_result(snapshot)
+    await second
+    assert source.uses_apple
+    assert session.get.call_count == 1
+    assert listener.await_count == 1
+
+
+async def test_listeners_notified_only_on_observable_change(source_env):
+    source, now, snapshot, session, _create, _dismiss, _stored = source_env
+    listener = AsyncMock()
+    await source.async_add_listener("one", "Room", listener)
+    assert listener.await_count == 1
+    # Expiry keeps the end node in use: retries change nothing observable.
+    now[0] = snapshot["validUntilMillis"]
+    snapshot.update(phase="expired", serverTimeMillis=now[0])
+    await source._async_update()
+    assert session.get.call_count == 2
+    now[0] += 60_000
+    await source._async_update()
+    assert session.get.call_count == 3
+    assert source.uses_apple
+    assert listener.await_count == 1
+    # Falling back to sun is observable, once.
+    now[0] = snapshot["validUntilMillis"] + 30 * 60 * 1000
+    await source._async_update()
+    assert not source.uses_apple
+    assert listener.await_count == 2
+    now[0] += 60_000
+    await source._async_update()
+    assert listener.await_count == 2
+    # A replacement plan is observable.
+    now[0] += 60_000
+    delta = now[0] - FIXTURE["serverTimeMillis"]
+    for key in ("effectiveStartMillis", "validFromMillis", "validUntilMillis"):
+        snapshot[key] = FIXTURE[key] + delta
+    snapshot.update(planId="replacement", phase="active", serverTimeMillis=now[0])
+    await source._async_update()
+    assert source.uses_apple
+    assert listener.await_count == 3
+
+
+async def test_store_written_only_on_change_and_periodic_observation(source_env):
+    source, now, snapshot, _session, _create, _dismiss, stored = source_env
+    with patch.object(
+        source._store,
+        "async_save",
+        wraps=source._store.async_save,
+    ) as save:
+        await source.async_add_listener("one", "Room", AsyncMock())
+        assert save.call_count == 1
+        # Unchanged content within the refresh interval is not rewritten.
+        for _ in range(3):
+            now[0] += 60_000
+            await source._async_update()
+        assert save.call_count == 1
+        # Expiry is more than one interval later: the observation time used
+        # against clock rollbacks is refreshed, then not on every retry.
+        now[0] = snapshot["validUntilMillis"]
+        snapshot.update(phase="expired", serverTimeMillis=now[0])
+        await source._async_update()
+        assert save.call_count == 2
+        for _ in range(14):
+            now[0] += 60_000
+            await source._async_update()
+        assert save.call_count == 2
+        now[0] += 60_000
+        await source._async_update()
+        assert save.call_count == 3
+        assert next(iter(stored.values()))["observedAt"] == now[0]
+        # New content is written at once.
+        delta = now[0] - FIXTURE["serverTimeMillis"]
+        for key in ("effectiveStartMillis", "validFromMillis", "validUntilMillis"):
+            snapshot[key] = FIXTURE[key] + delta
+        snapshot.update(planId="replacement", phase="active", serverTimeMillis=now[0])
+        now[0] += 60_000
+        await source._async_update()
+        assert save.call_count == 4
+        assert next(iter(stored.values()))["current"]["planId"] == "replacement"
+
+
+async def test_stale_anchors_are_pruned(source_env):
+    source, now, snapshot, _session, _create, _dismiss, stored = source_env
+    await source.async_add_listener("one", "Room", AsyncMock())
+    original_end = source._current.valid_until
+    day = 24 * 60 * 60 * 1000
+    source._anchors["ancient"] = [now[0] - 30 * day] * 2 + [now[0] - 29 * day]
+    source._anchors["recent"] = [now[0] - 2 * day] * 2 + [now[0] - day]
+    now[0] += 60_000
+    await source._async_update()
+    anchors = next(iter(stored.values()))["anchors"]
+    assert "ancient" not in anchors
+    assert "recent" in anchors
+    assert snapshot["planId"] in anchors
+    # The plan in use keeps its window however old it is.
+    now[0] = snapshot["validUntilMillis"] + 8 * day
+    snapshot.update(phase="expired", serverTimeMillis=now[0])
+    await source._async_update()
+    assert snapshot["planId"] in next(iter(stored.values()))["anchors"]
+    assert source._current.valid_until == original_end

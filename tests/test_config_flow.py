@@ -400,7 +400,7 @@ async def test_apple_options_second_step_preserves_settings_without_network(hass
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         user_input={
-            CONF_APPLE_PROBE_URL: "http://Probe.Example:80/",
+            CONF_APPLE_PROBE_URL: " http://Probe.Example:80/ ",
             CONF_APPLE_CURVE_ID: "ikea-matter",
         },
     )
