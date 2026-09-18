@@ -1,5 +1,6 @@
 """Constants for the Adaptive Lighting integration."""
 
+import re
 from datetime import timedelta
 from enum import Enum
 from typing import Any
@@ -37,8 +38,9 @@ DOCS[CONF_LIGHTS] = "List of light entity_ids to be controlled (may be empty). ð
 
 CONF_COLOR_SOURCE, DEFAULT_COLOR_SOURCE = "color_source", "sun"
 CONF_APPLE_PROBE_URL, DEFAULT_APPLE_PROBE_URL = "apple_probe_url", ""
-CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID = "apple_curve_id", "yeelight"
-APPLE_CURVE_IDS = ("yeelight", "ikea-zigbee", "ikea-matter")
+CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID = "apple_curve_id", ""
+# The collector accepts the same identifiers for its virtual lights.
+APPLE_CURVE_ID_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
 APPLE_OPTIONS = frozenset((CONF_APPLE_PROBE_URL, CONF_APPLE_CURVE_ID))
 DOCS[CONF_COLOR_SOURCE] = (
     "Use the sun algorithm or a captured Apple color-temperature plan."
@@ -47,7 +49,9 @@ DOCS[CONF_APPLE_PROBE_URL] = (
     "Apple Curve Probe base URL, for example http://192.168.1.50:8787."
 )
 DOCS[CONF_APPLE_CURVE_ID] = (
-    "Virtual light ID whose Apple plan should control these lights."
+    "ID of the probe's virtual light whose Apple plan should control these "
+    "lights (1-32 lowercase letters, digits or hyphens). The UI lists the "
+    "probe's lights to choose from."
 )
 
 
@@ -80,15 +84,25 @@ def normalize_apple_probe_url(value: str) -> str:
     return urlunsplit((parsed.scheme, authority, parsed.path.rstrip("/"), "", ""))
 
 
+def normalize_apple_curve_id(value: Any) -> str:
+    """Validate a virtual light ID the way the collector does."""
+    if isinstance(value, str):
+        value = value.strip()
+        if APPLE_CURVE_ID_PATTERN.match(value):
+            return value
+    message = "Enter an Apple curve ID of 1-32 lowercase letters, digits or hyphens"
+    raise vol.Invalid(message)
+
+
 def validate_apple_settings(data: dict[str, Any]) -> dict[str, Any]:
     """Require complete Apple configuration only when that source is selected."""
     if data.get(CONF_COLOR_SOURCE, DEFAULT_COLOR_SOURCE) == "apple":
         data[CONF_APPLE_PROBE_URL] = normalize_apple_probe_url(
             data.get(CONF_APPLE_PROBE_URL, ""),
         )
-        if data.get(CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID) not in APPLE_CURVE_IDS:
-            message = "Choose a supported Apple curve ID"
-            raise vol.Invalid(message)
+        data[CONF_APPLE_CURVE_ID] = normalize_apple_curve_id(
+            data.get(CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID),
+        )
     return data
 
 
@@ -420,7 +434,7 @@ def int_between(min_int: int, max_int: int) -> vol.All:
 VALIDATION_TUPLES: list[tuple[str, Any, Any]] = [
     (CONF_COLOR_SOURCE, DEFAULT_COLOR_SOURCE, vol.In(("sun", "apple"))),
     (CONF_APPLE_PROBE_URL, DEFAULT_APPLE_PROBE_URL, str),
-    (CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID, vol.In(APPLE_CURVE_IDS)),
+    (CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID, str),
     (CONF_LIGHTS, DEFAULT_LIGHTS, cv.entity_ids),  # type: ignore[arg-type]
     (CONF_INTERVAL, DEFAULT_INTERVAL, cv.positive_int),
     (CONF_TRANSITION, DEFAULT_TRANSITION, VALID_TRANSITION),

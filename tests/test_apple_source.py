@@ -579,3 +579,106 @@ async def test_stale_anchors_are_pruned(source_env):
     await source._async_update()
     assert snapshot["planId"] in next(iter(stored.values()))["anchors"]
     assert source._current.valid_until == original_end
+
+
+CATALOG_ROWS = [
+    {
+        "id": "living-room",
+        "label": "客厅",
+        "paired": True,
+        "minKelvin": 2700,
+        "maxKelvin": 6500,
+    },
+    # Label falls back to the accessory name, then to the ID; odd values are dropped.
+    {
+        "id": "hall",
+        "name": "Probe Hall",
+        "label": " ",
+        "paired": "yes",
+        "minKelvin": True,
+    },
+    {"id": "attic", "minKelvin": float("nan"), "maxKelvin": -1},
+    {"id": "living-room", "label": "duplicate"},
+    {"id": "Bad Id", "label": "rejected"},
+    {"label": "no id"},
+    "not an object",
+]
+
+
+def test_parse_catalog_reads_lights_and_skips_unusable_rows():
+    lights = apple_source.parse_catalog({"lights": CATALOG_ROWS})
+    assert lights == [
+        apple_source.AppleCatalogLight("living-room", "客厅", True, 2700, 6500),
+        apple_source.AppleCatalogLight("hall", "Probe Hall", False, None, None),
+        apple_source.AppleCatalogLight("attic", "attic", False, None, None),
+    ]
+    assert apple_source.parse_catalog({"lights": []}) == []
+    for payload in ([], {}, {"lights": {}}, {"lights": None}, "lights", None):
+        with pytest.raises(apple_source.AppleCatalogError, match="invalid response"):
+            apple_source.parse_catalog(payload)
+
+
+async def test_fetch_catalog_requests_once_and_normalizes_the_address(hass):
+    session = MagicMock()
+    session.get.side_effect = lambda *_args, **_kwargs: Response(
+        {"lights": CATALOG_ROWS[:1]},
+    )
+    with patch.object(apple_source, "async_get_clientsession", return_value=session):
+        lights = await apple_source.async_fetch_catalog(
+            hass,
+            "http://Probe.Example:80/",
+        )
+    assert [light.id for light in lights] == ["living-room"]
+    assert session.get.call_count == 1
+    assert session.get.call_args.args[0] == "http://probe.example/api/catalog"
+    assert session.get.call_args.kwargs["timeout"].total == (
+        apple_source.REQUEST_TIMEOUT_SECONDS
+    )
+
+
+class _FailingResponse(Response):
+    """A response whose status or body is unusable."""
+
+    def __init__(self, error):
+        super().__init__(None)
+        self.error = error
+
+    def raise_for_status(self):
+        if isinstance(self.error, aiohttp.ClientResponseError):
+            raise self.error
+
+    async def json(self):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [
+        (aiohttp.ClientError("refused"), "connection failed"),
+        (OSError("network down"), "connection failed"),
+        (TimeoutError(), "timed out"),
+        (
+            _FailingResponse(
+                aiohttp.ClientResponseError(MagicMock(), (), status=404),
+            ),
+            "HTTP 404",
+        ),
+        (
+            _FailingResponse(aiohttp.ContentTypeError(MagicMock(), ())),
+            "invalid response",
+        ),
+        (_FailingResponse(ValueError("bad json")), "invalid response"),
+        (Response(["not", "a", "catalog"]), "invalid response"),
+    ],
+)
+async def test_fetch_catalog_reports_short_reasons(hass, reply, message):
+    session = MagicMock()
+    if isinstance(reply, BaseException):
+        session.get.side_effect = reply
+    else:
+        session.get.return_value = reply
+    with (
+        patch.object(apple_source, "async_get_clientsession", return_value=session),
+        pytest.raises(apple_source.AppleCatalogError, match=f"^{message}$"),
+    ):
+        await apple_source.async_fetch_catalog(hass, "http://probe.example:8787")

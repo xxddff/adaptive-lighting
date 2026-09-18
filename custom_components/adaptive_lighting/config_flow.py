@@ -7,21 +7,28 @@ import voluptuous as vol
 from homeassistant import config_entries, data_entry_flow
 from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
-from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
+from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
+from .apple_source import AppleCatalogError, AppleCatalogLight, async_fetch_catalog
 from .const import (  # pylint: disable=unused-import
-    APPLE_CURVE_IDS,
     APPLE_OPTIONS,
     BASIC_OPTIONS,
     CONF_APPLE_CURVE_ID,
     CONF_APPLE_PROBE_URL,
     CONF_COLOR_SOURCE,
     CONF_LIGHTS,
-    DEFAULT_APPLE_CURVE_ID,
     DOMAIN,
     EXTRA_VALIDATION,
     NONE_STR,
     VALIDATION_TUPLES,
+    normalize_apple_curve_id,
     normalize_apple_probe_url,
     validate_apple_settings,
 )
@@ -34,6 +41,7 @@ OPTIONS_FLOW_DESCRIPTION_PLACEHOLDERS = {
     "docs_url": "https://github.com/basnijholt/adaptive-lighting#readme",
 }
 ADVANCED_OPTIONS_SECTION = "advanced"
+APPLE_STEP_DESCRIPTION_PLACEHOLDERS = {"example_url": "http://192.168.1.50:8787"}
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -139,10 +147,24 @@ def validate_options(user_input: dict[str, Any], errors: dict[str, str]) -> None
             errors["base"] = "option_error"
 
 
+def describe_apple_light(light: AppleCatalogLight) -> str:
+    """Label a collector light with its name, ID, Kelvin range and pairing state."""
+    parts = [light.id if light.label == light.id else f"{light.label} ({light.id})"]
+    if light.min_kelvin is not None and light.max_kelvin is not None:
+        parts.append(f"{light.min_kelvin}\u2013{light.max_kelvin} K")
+    if not light.paired:
+        parts.append("not paired")
+    return " \u00b7 ".join(parts)
+
+
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle a option flow for Adaptive Lighting."""
 
     _pending_options: dict[str, Any] | None = None
+    # The collector's lights for the address in the pending options; None
+    # when the last attempt to load them failed.
+    _apple_catalog: list[AppleCatalogLight] | None = None
+    _apple_catalog_error = ""
 
     def _flatten_section_input(self, user_input: dict[str, Any]) -> dict[str, Any]:
         """Flatten section input by merging nested 'advanced' dict into top level."""
@@ -226,35 +248,99 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         )
 
     async def async_step_apple(self, user_input: dict[str, Any] | None = None):
-        """Choose a probe and an explicit curve without requiring it to be online."""
+        """Enter the collector address, then load the virtual lights it offers."""
         assert self._pending_options is not None
-        data = dict(self._pending_options)
+        data = self._pending_options
         errors: dict[str, str] = {}
         if user_input is not None:
-            data.update(user_input)
             try:
-                data[CONF_APPLE_PROBE_URL] = normalize_apple_probe_url(
-                    data.get(CONF_APPLE_PROBE_URL, ""),
+                url = normalize_apple_probe_url(
+                    user_input.get(CONF_APPLE_PROBE_URL, ""),
                 )
             except vol.Invalid:
                 errors[CONF_APPLE_PROBE_URL] = "invalid_probe_url"
-            if data.get(CONF_APPLE_CURVE_ID) not in APPLE_CURVE_IDS:
-                errors[CONF_APPLE_CURVE_ID] = "invalid_curve_id"
-            if not errors:
-                return self.async_create_entry(title="", data=data)
+            else:
+                data[CONF_APPLE_PROBE_URL] = url
+                try:
+                    self._apple_catalog = await async_fetch_catalog(self.hass, url)
+                except AppleCatalogError as err:
+                    self._apple_catalog = None
+                    self._apple_catalog_error = str(err)
+                    _LOGGER.warning(
+                        "Cannot list the virtual lights of the Apple curve probe "
+                        "at %s: %s",
+                        url,
+                        err,
+                    )
+                    return await self.async_step_apple_offline()
+                return await self.async_step_apple_curve()
+        current = (user_input or data).get(CONF_APPLE_PROBE_URL, "")
         return self.async_show_form(
             step_id="apple",
             data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_APPLE_PROBE_URL,
-                        default=data.get(CONF_APPLE_PROBE_URL, ""),
-                    ): str,
-                    vol.Required(
-                        CONF_APPLE_CURVE_ID,
-                        default=data.get(CONF_APPLE_CURVE_ID, DEFAULT_APPLE_CURVE_ID),
-                    ): vol.In(APPLE_CURVE_IDS),
-                },
+                {vol.Required(CONF_APPLE_PROBE_URL, default=current): str},
             ),
             errors=errors,
+            description_placeholders=APPLE_STEP_DESCRIPTION_PLACEHOLDERS,
+        )
+
+    async def async_step_apple_offline(
+        self,
+        user_input: dict[str, Any] | None = None,  # noqa: ARG002
+    ):
+        """Offer to correct the address or to enter the curve ID without a list."""
+        assert self._pending_options is not None
+        return self.async_show_menu(
+            step_id="apple_offline",
+            menu_options=["apple", "apple_curve"],
+            description_placeholders={
+                "url": self._pending_options.get(CONF_APPLE_PROBE_URL, ""),
+                "error": self._apple_catalog_error,
+            },
+        )
+
+    async def async_step_apple_curve(self, user_input: dict[str, Any] | None = None):
+        """Pick one of the collector's virtual lights, or type an ID by hand."""
+        assert self._pending_options is not None
+        data = self._pending_options
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                data[CONF_APPLE_CURVE_ID] = normalize_apple_curve_id(
+                    user_input.get(CONF_APPLE_CURVE_ID, ""),
+                )
+            except vol.Invalid:
+                errors[CONF_APPLE_CURVE_ID] = "invalid_curve_id"
+            else:
+                return self.async_create_entry(title="", data=data)
+        elif self._apple_catalog is not None and not self._apple_catalog:
+            errors["base"] = "catalog_empty"
+        current = (user_input or data).get(CONF_APPLE_CURVE_ID, "")
+        key = (
+            vol.Required(CONF_APPLE_CURVE_ID, default=current)
+            if current
+            else vol.Required(CONF_APPLE_CURVE_ID)
+        )
+        # A saved or typed ID may name a light the collector does not list
+        # (yet), so the list never restricts what can be entered.
+        selector: Any = str
+        if self._apple_catalog:
+            selector = SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(
+                            value=light.id,
+                            label=describe_apple_light(light),
+                        )
+                        for light in self._apple_catalog
+                    ],
+                    custom_value=True,
+                    mode=SelectSelectorMode.DROPDOWN,
+                ),
+            )
+        return self.async_show_form(
+            step_id="apple_curve",
+            data_schema=vol.Schema({key: selector}),
+            errors=errors,
+            description_placeholders={"url": data.get(CONF_APPLE_PROBE_URL, "")},
         )

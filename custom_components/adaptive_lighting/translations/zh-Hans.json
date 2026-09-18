@@ -97,9 +97,23 @@
       },
       "apple": {
         "title": "Apple 曲线来源",
-        "description": "填写 Home Assistant 可以访问的采集器基础地址，并选择虚拟灯 ID。采集器离线时也可以保存。",
+        "description": "填写 Home Assistant 可以访问的采集器基础地址，例如 {example_url}。Home Assistant 会向采集器请求现有的虚拟灯列表供选择；采集器离线时，下一步仍可手动填写曲线 ID。",
         "data": {
-          "apple_probe_url": "采集器基础地址",
+          "apple_probe_url": "采集器基础地址"
+        }
+      },
+      "apple_offline": {
+        "title": "无法连接采集器",
+        "description": "无法从 {url} 读取虚拟灯列表（{error}）。可以修改地址，或继续手动填写曲线 ID。",
+        "menu_options": {
+          "apple": "修改地址",
+          "apple_curve": "手动填写曲线 ID"
+        }
+      },
+      "apple_curve": {
+        "title": "Apple 曲线",
+        "description": "从 {url} 上的虚拟灯中选择一盏，用它的 Apple 计划控制这些灯；也可以直接输入尚未创建的灯的 ID。ID 为 1–32 个小写字母、数字或连字符，与采集器上填写的一致。标有 “not paired” 的灯尚未添加到家庭 App。",
+        "data": {
           "apple_curve_id": "曲线 ID"
         }
       }
@@ -108,7 +122,8 @@
       "option_error": "无效的选项",
       "entity_missing": "一个或多个选择的灯光实体在Home Assistant中不存在",
       "invalid_probe_url": "请填写 HTTP(S) 基础地址，不包含账号密码、查询参数或片段。",
-      "invalid_curve_id": "请选择三种支持的曲线 ID 之一。"
+      "invalid_curve_id": "请输入由 1–32 个小写字母、数字或连字符组成的曲线 ID。",
+      "catalog_empty": "采集器上还没有虚拟灯。请先在采集器网页新建一盏，或直接输入将要使用的 ID。"
     }
   },
   "services": {

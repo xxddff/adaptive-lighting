@@ -97,7 +97,11 @@ with en_fname.open() as f:
 
 en["config"]["step"]["user"] = strings["config"]["step"]["user"]
 en["options"]["step"]["init"] = deepcopy(options_step)
-en["options"]["step"]["apple"] = deepcopy(strings["options"]["step"]["apple"])
+# The Apple curve steps are hand-written in strings.json; keep en.json identical.
+for step_id, step in strings["options"]["step"].items():
+    if step_id != "init":
+        en["options"]["step"][step_id] = deepcopy(step)
+en["options"]["error"] = deepcopy(strings["options"]["error"])
 en["services"] = services_json
 
 with en_fname.open("w") as f:

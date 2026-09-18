@@ -17,7 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 
 from .apple_curve import AppleCurve, finite_number
-from .const import normalize_apple_probe_url
+from .const import APPLE_CURVE_ID_PATTERN, normalize_apple_probe_url
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -54,6 +54,95 @@ class ApplePlan:
     def available(self, now: float) -> bool:
         """Whether the plan is executable, including the end-node grace period."""
         return self.valid_from <= now < self.grace_until
+
+
+@dataclass(frozen=True)
+class AppleCatalogLight:
+    """A virtual light the collector currently publishes."""
+
+    id: str
+    label: str
+    paired: bool
+    min_kelvin: int | None
+    max_kelvin: int | None
+
+
+class AppleCatalogError(Exception):
+    """The collector's list of virtual lights could not be loaded."""
+
+
+def _optional_kelvin(value: Any) -> int | None:
+    """Return a positive Kelvin bound, or None when the collector sent none."""
+    try:
+        return round(finite_number(value, "kelvin", 1))
+    except ValueError:
+        return None
+
+
+def parse_catalog(payload: Any) -> list[AppleCatalogLight]:
+    """Read the collector's ``/api/catalog`` document, skipping unusable rows."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("lights"), list):
+        msg = "invalid response"
+        raise AppleCatalogError(msg)
+    lights: list[AppleCatalogLight] = []
+    seen: set[str] = set()
+    for item in payload["lights"]:
+        light_id = item.get("id") if isinstance(item, dict) else None
+        if (
+            not isinstance(light_id, str)
+            or not APPLE_CURVE_ID_PATTERN.match(light_id)
+            or light_id in seen
+        ):
+            _LOGGER.debug("Skipping unusable Apple catalog entry: %s", item)
+            continue
+        seen.add(light_id)
+        label = item.get("label")
+        if not isinstance(label, str) or not label.strip():
+            name = item.get("name")
+            label = name if isinstance(name, str) and name.strip() else light_id
+        lights.append(
+            AppleCatalogLight(
+                id=light_id,
+                label=label.strip(),
+                paired=item.get("paired") is True,
+                min_kelvin=_optional_kelvin(item.get("minKelvin")),
+                max_kelvin=_optional_kelvin(item.get("maxKelvin")),
+            ),
+        )
+    return lights
+
+
+async def async_fetch_catalog(hass: HomeAssistant, url: str) -> list[AppleCatalogLight]:
+    """Ask the collector once which virtual lights exist.
+
+    Raises AppleCatalogError with a short reason when the collector cannot be
+    reached or answers with something other than a catalog.
+    """
+    endpoint = f"{normalize_apple_probe_url(url)}/api/catalog"
+    try:
+        session = async_get_clientsession(hass)
+        async with session.get(
+            endpoint,
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
+    except aiohttp.ContentTypeError as err:
+        msg = "invalid response"
+        raise AppleCatalogError(msg) from err
+    except aiohttp.ClientResponseError as err:
+        msg = f"HTTP {err.status}"
+        raise AppleCatalogError(msg) from err
+    except TimeoutError as err:
+        msg = "timed out"
+        raise AppleCatalogError(msg) from err
+    except (aiohttp.ClientError, OSError) as err:
+        msg = "connection failed"
+        raise AppleCatalogError(msg) from err
+    except ValueError as err:
+        msg = "invalid response"
+        raise AppleCatalogError(msg) from err
+    return parse_catalog(payload)
 
 
 def _same_plan(cached: ApplePlan | None, plan: ApplePlan) -> bool:
