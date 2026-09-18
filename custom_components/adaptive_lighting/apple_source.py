@@ -27,6 +27,8 @@ REGISTRY_KEY = "adaptive_lighting_apple_sources"
 RETRY_SECONDS = 60
 GRACE_SECONDS = 30 * 60
 REQUEST_TIMEOUT_SECONDS = 10
+OBSERVED_REFRESH_SECONDS = 15 * 60
+ANCHOR_RETENTION_SECONDS = 7 * 24 * 60 * 60
 Listener = Callable[[], Awaitable[None]]
 
 
@@ -52,6 +54,11 @@ class ApplePlan:
     def available(self, now: float) -> bool:
         """Whether the plan is executable, including the end-node grace period."""
         return self.valid_from <= now < self.grace_until
+
+
+def _same_plan(cached: ApplePlan | None, plan: ApplePlan) -> bool:
+    """Whether a received plan is the cached one, whatever its response clock says."""
+    return cached is not None and cached.snapshot["planId"] == plan.snapshot["planId"]
 
 
 async def async_get_source(
@@ -94,6 +101,9 @@ class AppleSource:
         self._mono_origin = time.monotonic()
         self._reason = "No usable Apple plan is available."
         self._notification: str | None = None
+        self._published: tuple[bool, str | None] | None = None
+        self._saved: dict[str, Any] | None = None
+        self._saved_at = 0.0
 
     def _now(self) -> float:
         """Use wall time only as an origin; runtime clock jumps cannot renew plans."""
@@ -123,11 +133,22 @@ class AppleSource:
         name: str,
         callback: Listener,
     ) -> None:
-        """Activate a configuration and initialize its shared cached plan."""
+        """Activate a configuration and initialize its shared cached plan.
+
+        Returns once the cache is loaded and, without a valid plan, one request
+        has finished. Deactivating the source meanwhile cancels that work
+        without raising into the caller.
+        """
         self._listeners[owner_id] = (name, callback)
         if self._task is None or self._task.done():
             self._task = self.hass.async_create_task(self._async_update())
-        await asyncio.shield(self._task)
+        task = self._task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A cancelled caller leaves the shared work running for the others.
+            if not task.cancelled():
+                raise
 
     async def async_remove_listener(self, owner_id: str) -> None:
         """Remove a configuration and stop all work when no owners remain."""
@@ -229,21 +250,50 @@ class AppleSource:
                     self._current = self._read_plan(data["current"], self._now())
                 if data.get("pending"):
                     self._pending = self._read_plan(data["pending"], self._now())
+                self._saved = self._payload()
+                self._saved_at = observed
         except (ValueError, TypeError, KeyError, AttributeError, OSError):
             _LOGGER.warning("Cannot restore Apple curve cache for %s", self.curve_id)
             self._current = self._pending = None
         self._loaded = True
 
+    def _payload(self) -> dict[str, Any]:
+        """Return the queued and current plans with their original local windows."""
+        return {
+            "anchors": dict(self._anchors),
+            "current": self._current.snapshot if self._current else None,
+            "pending": self._pending.snapshot if self._pending else None,
+        }
+
+    def _prune_anchors(self, now: float) -> None:
+        """Forget the windows of plans that ended long ago and are not in use."""
+        in_use = {
+            plan.snapshot["planId"]
+            for plan in (self._current, self._pending)
+            if plan is not None
+        }
+        cutoff = now - (GRACE_SECONDS + ANCHOR_RETENTION_SECONDS) * 1000
+        for plan_id, (_start, _valid_from, until) in tuple(self._anchors.items()):
+            if plan_id not in in_use and until < cutoff:
+                del self._anchors[plan_id]
+
     async def _async_save(self) -> None:
-        """Persist both queued and current plans with their original local windows."""
-        await self._store.async_save(
-            {
-                "observedAt": self._now(),
-                "anchors": self._anchors,
-                "current": self._current.snapshot if self._current else None,
-                "pending": self._pending.snapshot if self._pending else None,
-            },
-        )
+        """Persist changes; refresh the observation time only occasionally.
+
+        Retries while the collector is unreachable run every minute and must
+        not rewrite the cache each time.
+        """
+        now = self._now()
+        self._prune_anchors(now)
+        payload = self._payload()
+        if (
+            payload == self._saved
+            and now - self._saved_at < OBSERVED_REFRESH_SECONDS * 1000
+        ):
+            return
+        await self._store.async_save({"observedAt": now, **payload})
+        self._saved = payload
+        self._saved_at = now
 
     def _accept_snapshot(self, snapshot: Any, observed_at: float | None = None) -> None:
         """Apply a validated protocol state without replacing grace with old data."""
@@ -268,10 +318,14 @@ class AppleSource:
         now = self._now()
         plan = self._read_plan(snapshot, now if observed_at is None else observed_at)
         if plan.valid_from > now:
-            self._pending = plan
+            if not _same_plan(self._pending, plan):
+                self._pending = plan
             self._reason = "The next Apple plan has not started yet."
         elif self._current is None or plan.valid_until >= self._current.valid_until:
-            self._current = plan
+            # A re-sent plan keeps its cached object: the collector's clock
+            # fields differ per response but change nothing about the plan.
+            if not _same_plan(self._current, plan):
+                self._current = plan
             if self._pending and self._pending.valid_until <= plan.valid_until:
                 self._pending = None
             self._reason = "The Apple plan has expired."
@@ -341,15 +395,26 @@ class AppleSource:
             return
         self._update_notification()
         was_apple = self.uses_apple
-        callbacks = [callback() for _, callback in tuple(self._listeners.values())]
-        results = await asyncio.gather(*callbacks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                _LOGGER.error("Apple plan listener failed: %s", result)
+        state = self._observable_state()
+        if state != self._published:
+            # Listeners re-adapt their lights when called, so only a change of
+            # the color function in use is published.
+            self._published = state
+            callbacks = [callback() for _, callback in tuple(self._listeners.values())]
+            results = await asyncio.gather(*callbacks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    _LOGGER.error("Apple plan listener failed: %s", result)
         if generation == self._generation and self._listeners:
             if was_apple != self.uses_apple:
                 self._next_request = min(self._next_request, self._now())
             self._schedule()
+
+    def _observable_state(self) -> tuple[bool, str | None]:
+        """Identify the color function listeners get now: sun, or which plan."""
+        if self._current is None or not self.uses_apple:
+            return (False, None)
+        return (True, self._current.snapshot["planId"])
 
     def _schedule(self) -> None:
         if self._timer is not None:

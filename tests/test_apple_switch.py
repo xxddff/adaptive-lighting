@@ -29,6 +29,7 @@ from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_RGB_COLOR,
+    ATTR_TRANSITION,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -81,6 +82,11 @@ class FakeAppleSource:
     def expected_kelvin(brightness):
         """Compute the expected result in HA brightness units."""
         return round(2500 + brightness * 10)
+
+
+def assert_kelvin_close(actual, expected):
+    """Compare in mired space: lights quantize color temperature to whole mireds."""
+    assert abs(round(1_000_000 / actual) - round(1_000_000 / expected)) <= 1
 
 
 def reported_kelvin(light, kelvin):
@@ -541,3 +547,92 @@ async def test_apple_runtime_factory_reset_preserves_provider(hass, apple_source
     assert switch._current_settings[CONF_APPLE_CURVE_ID] == "yeelight"
     assert switch._apple_source is apple_source
     assert len(apple_source.listeners) == 1
+
+
+@pytest.mark.parametrize(
+    ("brightness_param", "value", "brightness"),
+    [
+        ("brightness", "80", 80),
+        ("brightness_pct", "20", 51),
+        ("brightness_step_pct", "20", 51),
+    ],
+)
+async def test_apple_raw_event_brightness_strings_are_coerced(
+    hass,
+    apple_source,
+    caplog,
+    brightness_param,
+    value,
+    brightness,
+):
+    """Service-call events carry unvalidated data that the light service accepts."""
+    switch, _ = await setup_apple(hass, **{CONF_INTERCEPT: False})
+    await hass.services.async_call(
+        "light",
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: ENTITY_LIGHT_3, brightness_param: value},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    await asyncio.gather(*switch.manager.adaptation_tasks)
+    state = hass.states.get(ENTITY_LIGHT_3)
+    assert state.attributes[ATTR_BRIGHTNESS] == brightness
+    assert_kelvin_close(
+        state.attributes[ATTR_COLOR_TEMP_KELVIN],
+        apple_source.expected_kelvin(brightness),
+    )
+    assert "TypeError" not in caplog.text
+
+
+async def test_apple_brightness_report_during_own_fade_is_deferred(
+    hass,
+    apple_source,
+):
+    """Intermediate reports of our own fade are neither dimming nor manual control."""
+    switch, lights = await setup_apple(hass)
+    light, manager = lights[0], switch.manager
+
+    def report(brightness):
+        set_light_brightness(light, brightness)
+        light.async_set_context(Context())
+        light.async_write_ha_state()
+
+    manager.last_service_data[ENTITY_LIGHT_1] = {
+        ATTR_BRIGHTNESS: 200,
+        ATTR_TRANSITION: 0.6,
+    }
+    manager.start_transition_timer(ENTITY_LIGHT_1)
+    apple_source.inputs.clear()
+    report(120)
+    await hass.async_block_till_done()
+    await asyncio.sleep(0.3)
+    await hass.async_block_till_done()
+    assert not apple_source.inputs
+    assert (
+        manager.get_manual_control_attributes(ENTITY_LIGHT_1)
+        == LightControlAttributes.NONE
+    )
+    # The fade ends where it was sent: the color already matches.
+    report(200)
+    await asyncio.sleep(0.8)
+    await hass.async_block_till_done()
+    assert not apple_source.inputs
+    assert (
+        manager.get_manual_control_attributes(ENTITY_LIGHT_1)
+        == LightControlAttributes.NONE
+    )
+    assert not switch._apple_brightness_timers
+    # Real dimming during a fade is applied once the fade has ended.
+    manager.start_transition_timer(ENTITY_LIGHT_1)
+    report(95)
+    await asyncio.sleep(0.3)
+    await hass.async_block_till_done()
+    assert not apple_source.inputs
+    await asyncio.sleep(0.6)
+    await hass.async_block_till_done()
+    assert apple_source.inputs
+    assert apple_source.inputs[-1][0] == pytest.approx(95 * 100 / 255)
+    assert (
+        manager.get_manual_control_attributes(ENTITY_LIGHT_1)
+        == LightControlAttributes.BRIGHTNESS
+    )
